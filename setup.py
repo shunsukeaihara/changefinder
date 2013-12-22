@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 from setuptools import setup
-version="0.01"
+version="0.02"
 README = os.path.join(os.path.dirname(__file__),"README.rst")
 long_description = open(README).read() + '\n\n'
 setup(name="changefinder",

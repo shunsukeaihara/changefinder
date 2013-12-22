@@ -1,7 +1,7 @@
 changefinder
 ===========
 
-Online  Change-Point Detection Library based on ChangeFinder Algorithm.
+Online Change-Point Detection Library based on ChangeFinder Algorithm.
 
 Authors & Contributors
 ----------------------

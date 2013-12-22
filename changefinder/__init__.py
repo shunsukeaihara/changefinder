@@ -84,15 +84,24 @@ class ChangeFinder(object):
 
     def update(self,one):
         if len(self._ts) == self._term:#第一段学習
-            self._add_one(self._calc_outlier_score(self._ts,one),self._first_scores,self._smooth)
+            try:
+                self._add_one(self._calc_outlier_score(self._ts,one),self._first_scores,self._smooth)
+            except:
+                self._add_one(one,self._ts,self._term)
+                return 0
         self._add_one(one,self._ts,self._term)
+
         second_target = None
         if len(self._first_scores) == self._smooth:#平滑化
             second_target = self._smoothing(self._first_scores)
 
         if second_target and len(self._smoothed_scores) == self._term:#第二段学習
-            self._add_one(self._calc_outlier_score(self._smoothed_scores,second_target),
-                          self._second_scores,self._smooth2)
+            try:
+                self._add_one(self._calc_outlier_score(self._smoothed_scores,second_target),
+                              self._second_scores,self._smooth2)
+            except:
+                self._add_one(second_target,self._smoothed_scores, self._term)
+                return 0
         if second_target:
             self._add_one(second_target,self._smoothed_scores, self._term)
         if len(self._second_scores) == self._smooth2:
