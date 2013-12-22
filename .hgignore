@@ -1,0 +1,16 @@
+syntax: glob
+*.pyc
+*.pyo
+*.o
+*~
+.DS_Store
+#*
+\#*.html\#
+\.\#*
+*.*~
+\#*.*\#
+migrations
+csv
+*.csv
+*.egg-info
+dist

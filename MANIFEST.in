@@ -1,0 +1,2 @@
+include README.rst MANIFEST.in LICENSE.txt
+recursive-include test *.py
