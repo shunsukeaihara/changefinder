@@ -82,14 +82,14 @@ class ChangeFinder(object):
         ts = np.array(ts)
         return np.convolve(ts,self._convolve2,'valid')[0]
 
-    def update(self,one):
+    def update(self,sample):
         if len(self._ts) == self._term:#第一段学習
             try:
-                self._add_one(self._calc_outlier_score(self._ts,one),self._first_scores,self._smooth)
+                self._add_one(self._calc_outlier_score(self._ts,sample),self._first_scores,self._smooth)
             except:
-                self._add_one(one,self._ts,self._term)
+                self._add_one(sample,self._ts,self._term)
                 return 0
-        self._add_one(one,self._ts,self._term)
+        self._add_one(sample,self._ts,self._term)
 
         second_target = None
         if len(self._first_scores) == self._smooth:#平滑化
