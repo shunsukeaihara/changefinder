@@ -3,51 +3,6 @@ import statsmodels.api as sm
 import numpy as np
 import scipy as sp
 import math
-"""
-def change_finder(ts, term=30, smooth=7, order=(1,0,0)):
-    length = ts.size()
-    first_step  = []
-    for i in range(term+1,length):
-        train = ts[i-term-1:i-1]
-        target = ts[i]
-        first_step.append(calc_outlier_score(train,target,order))
-    first_step = np.array(first_step)
-    smoothed = smoothing(first_step,smooth)
-    length2 = len(smoothed)
-    second_step = []
-    for i in range(term+1,length2):
-        train = ts[i-term-1:i-1]
-        target = ts[i]
-        second_step.append(calc_outlier_score(train,target,order))
-    second_step = np.array(second_step)
-    smoothed = smoothing(second_step,int(round(smooth/2.0)))
-    return np.concatenate(np.zeros(length-len(smoothed)),smoothed)
-
-
-def smoothing(ts,smooth):
-    convolve = np.ones(smooth)/smooth
-    return np.convolve(ts,convolve,'valid')
-
-def calc_outlier_score(ts,target,order):
-    arima_model = sm.tsa.ARIMA(ts,order)
-    result = arima_model.fit()
-    pred = result.forecast(1)[0][0]
-    return outlier_score(result.resid(),x=pred-target)
-
-
-def outlier_score(residuals,x):
-    m = residuals.mean()
-    s = np.std(residuals,ddof=1)
-    return -sp.stats.norm.logpdf(x,m,s)
-
-"""
-"""
-import numpy as np
-from changefinder import SDAR_1Dim
-s=SDAR_1Dim(0.5)
-x=np.random.rand(30)
-s.update(0.22,x)
-"""
 
 
 def LevinsonDurbin(r, lpcOrder):
@@ -83,7 +38,7 @@ def LevinsonDurbin(r, lpcOrder):
 
 
 class _SDAR_1Dim(object):
-    def __init__(self, r, term,order = 5):
+    def __init__(self, r, term,order):
         self._r = r
         self._mu = np.random.random()
         self._sigma = np.random.random()
@@ -92,24 +47,20 @@ class _SDAR_1Dim(object):
         self._c = np.zeros(self._term+1)
 
     def update(self,x,term):
-        def outlier_score(residuals,x):
-            m = residuals.mean()
-            s = np.std(residuals,ddof=1)
-            return -sp.stats.norm.logpdf(x,m,s)
-
         term = np.array(term)
         self._mu = (1 - self._r) * self._mu + self._r * x
         for i in range(1,self._term):
             self._c[i] = (1-self._r)*self._c[i]+self._r * (x-self._mu) * (term[-i]-self._mu)
         self._c[0] = (1-self._r)*self._c[0]+self._r * (x-self._mu)*(x-self._mu)
-
         what,e = LevinsonDurbin(self._c,self._order)
         xhat = np.dot(-what[1:],(term[::-1][:self._order]  - self._mu))+self._mu
         self._sigma = (1-self._r)*self._sigma + self._r * (x-xhat) * (x-xhat)
         return -math.log(math.exp(-0.5 *(x-xhat)**2/self._sigma)/((2 * math.pi)**0.5 * self._sigma**0.5))
 
-class ChangeFinderSDAR(object):
-    def __init__(self, r = 0.5, term=10, smooth=7):
+class ChangeFinder(object):
+    def __init__(self, r = 0.5, term=30, smooth=7,order = 1):
+        assert smooth > 2, "term must be 3 or more."
+        assert term > smooth, "term must be more than smooth"
         self._smooth = smooth
         self._term = term
         self._r = r
@@ -120,8 +71,8 @@ class ChangeFinderSDAR(object):
         self._convolve = np.ones(self._smooth)
         self._smooth2 = int(round(self._smooth/2.0))
         self._convolve2 = np.ones(int(round(self._smooth2)))
-        self._sdar_first = _SDAR_1Dim(r,term)
-        self._sdar_second = _SDAR_1Dim(r,term)
+        self._sdar_first = _SDAR_1Dim(r,term,order)
+        self._sdar_second = _SDAR_1Dim(r,term,order)
 
     def _add_one(self,one,ts,size):
         ts.append(one)
@@ -158,7 +109,7 @@ class ChangeFinderSDAR(object):
             return 0.0
 
 
-class _ChangeFinder(object):
+class ChangeFinderARIMA(object):
     def __init__(self,term = 30, smooth = 7, order = (1,0,0)):
         assert smooth > 2, "term must be 3 or more."
         assert term > smooth, "term must be more than smooth"
