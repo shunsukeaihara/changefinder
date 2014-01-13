@@ -13,7 +13,7 @@ class TestChangeFinder():
                                    np.random.rand(300)+5,
                                    np.random.rand(300)])
     def test_changefinder(self):
-        cf = changefinder.ChangeFinder(self._term,self._smooth,self._order)
+        cf = changefinder.ChangeFinder(self._order,self._smooth)
 
         for i in self._data:
             cf.update(i)
