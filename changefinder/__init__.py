@@ -64,27 +64,21 @@ class _ChangeFinderAbstract(object):
             ts.pop(0)
 
     def _smoothing(self,ts):
-        ts = np.array(ts)
-        return np.convolve(ts,self._convolve,'valid')[0]/self._smooth
+        return sum(ts)/float(len(ts))
 
-    def _smoothing2(self,ts):
-        ts = np.array(ts)
-        return np.convolve(ts,self._convolve2,'valid')[0]/self._smooth2
 
 class ChangeFinder(_ChangeFinderAbstract):
     def __init__(self, r = 0.5, order = 1, smooth=7):
         assert order > 0, "order must be 1 or more."
         assert smooth > 2, "term must be 3 or more."
         self._smooth = smooth
+        self._smooth2 = int(round(self._smooth/2.0))
         self._order = order
         self._r = r
         self._ts = []
         self._first_scores = []
         self._smoothed_scores = []
         self._second_scores = []
-        self._convolve = np.ones(self._smooth)
-        self._smooth2 = int(round(self._smooth/2.0))
-        self._convolve2 = np.ones(int(round(self._smooth2)))
         self._sdar_first = _SDAR_1Dim(r,self._order)
         self._sdar_second = _SDAR_1Dim(r,self._order)
 
@@ -106,7 +100,7 @@ class ChangeFinder(_ChangeFinderAbstract):
         if second_target:
             self._add_one(second_target,self._smoothed_scores, self._order)
         if len(self._second_scores) == self._smooth2:
-            return self._smoothing2(self._second_scores),predict
+            return self._smoothing(self._second_scores),predict
         else:
             return 0.0,predict
 
@@ -118,14 +112,12 @@ class ChangeFinderARIMA(_ChangeFinderAbstract):
 
         self._term = term
         self._smooth = smooth
+        self._smooth2 = int(round(self._smooth/2.0))
         self._order = order
         self._ts = []
         self._first_scores = []
         self._smoothed_scores = []
         self._second_scores = []
-        self._convolve = np.ones(self._smooth)
-        self._smooth2 = int(round(self._smooth/2.0))
-        self._convolve2 = np.ones(int(round(self._smooth2)))
 
     def _calc_outlier_score(self,ts,target):
         def outlier_score(residuals,x):
@@ -164,6 +156,6 @@ class ChangeFinderARIMA(_ChangeFinderAbstract):
         if second_target:
             self._add_one(second_target,self._smoothed_scores, self._term)
         if len(self._second_scores) == self._smooth2:
-            return self._smoothing2(self._second_scores),predict
+            return self._smoothing(self._second_scores),predict
         else:
             return 0.0,predict
