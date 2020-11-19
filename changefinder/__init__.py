@@ -48,14 +48,31 @@ class _SDAR_1Dim(object):
     def update(self, x, term):
         assert len(term) >= self._order, "term must be order or more"
         term = np.array(term)
-        self._mu = (1.0 - self._r) * self._mu + self._r * x
-        for i in range(1, self._order + 1):
-            self._c[i] = (1 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
-        self._c[0] = (1-self._r)*self._c[0]+self._r * (x-self._mu)*(x-self._mu)
-        what, e = LevinsonDurbin(self._c, self._order)
-        xhat = np.dot(-what[1:], (term[::-1] - self._mu))+self._mu
-        self._sigma = (1-self._r)*self._sigma + self._r * (x-xhat) * (x-xhat)
-        return -math.log(math.exp(-0.5*(x-xhat)**2/self._sigma)/((2 * math.pi)**0.5*self._sigma**0.5)), xhat
+        
+    def update(self,x,term, inplace=True):
+        assert len(term) >= self._order, "term must be order or more"
+        term = np.array(term)
+        if inplace:
+            self._mu = (1.0 - self._r) * self._mu + self._r * x
+            for i in range(1, self._order + 1):
+                self._c[i] = (1 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
+            self._c[0] = (1-self._r)*self._c[0]+self._r * (x-self._mu)*(x-self._mu)
+            what, e = LevinsonDurbin(self._c, self._order)
+            xhat = np.dot(-what[1:], (term[::-1] - self._mu))+self._mu
+            self._sigma = (1-self._r)*self._sigma + self._r * (x-xhat) * (x-xhat)
+            return -math.log(math.exp(-0.5*(x-xhat)**2/self._sigma)/((2 * math.pi)**0.5*self._sigma**0.5)), xhat
+        else:
+            _mu = (1 - self._r) * self._mu + self._r * x
+            _c = self._c[:]
+            for i in range(1, self._order):
+                _c[i] = (1 - self._r) * self._c[i] + self._r * (x - _mu) * (term[-i] - _mu)
+            _c[0] = (1 - self._r) * self._c[0] + self._r * (x - _mu) * (x - _mu)
+            what, e = LevinsonDurbin(_c, self._order)
+            xhat = np.dot(-what[1:], (term[::-1] - _mu)) + _mu
+            _sigma = (1 - self._r) * self._sigma + self._r * (x - xhat) * (x - xhat)
+            return -math.log(
+                math.exp(-0.5 * (x - xhat) ** 2 / _sigma) / ((2 * math.pi) ** 0.5 * _sigma ** 0.5)), xhat
+
 
 
 class _ChangeFinderAbstract(object):
@@ -83,27 +100,50 @@ class ChangeFinder(_ChangeFinderAbstract):
         self._sdar_first = _SDAR_1Dim(r, self._order)
         self._sdar_second = _SDAR_1Dim(r, self._order)
 
-    def update(self, x):
+    def update(self,x,inplace=True):
         score = 0
         predict = x
         predict2 = 0
-        if len(self._ts) == self._order:  # 第一段学習
-            score, predict = self._sdar_first.update(x, self._ts)
-            self._add_one(score, self._first_scores, self._smooth)
-        self._add_one(x, self._ts, self._order)
-        second_target = None
-        if len(self._first_scores) == self._smooth:  # 平滑化
-            second_target = self._smoothing(self._first_scores)
-        if second_target and len(self._smoothed_scores) == self._order:  # 第二段学習
-            score, predict2 = self._sdar_second.update(second_target, self._smoothed_scores)
-            self._add_one(score,
-                          self._second_scores, self._smooth2)
-        if second_target:
-            self._add_one(second_target, self._smoothed_scores, self._order)
-        if len(self._second_scores) == self._smooth2:
-            return self._smoothing(self._second_scores), predict
+        if inplace:
+            if len(self._ts) == self._order:  # 第一段学習
+                score, predict = self._sdar_first.update(x, self._ts)
+                self._add_one(score, self._first_scores, self._smooth)
+            self._add_one(x, self._ts, self._order)
+            second_target = None
+            if len(self._first_scores) == self._smooth:  # 平滑化
+                second_target = self._smoothing(self._first_scores)
+            if second_target and len(self._smoothed_scores) == self._order:  # 第二段学習
+                score, predict2 = self._sdar_second.update(second_target, self._smoothed_scores)
+                self._add_one(score,
+                              self._second_scores, self._smooth2)
+            if second_target:
+                self._add_one(second_target, self._smoothed_scores, self._order)
+            if len(self._second_scores) == self._smooth2:
+                return self._smoothing(self._second_scores), predict
+            else:
+                return 0.0, predict
         else:
-            return 0.0, predict
+            _first_scores = self._first_scores[:]
+            _ts = self._ts[:]
+            _smoothed_scores = self._smoothed_scores[:]
+            _second_scores = self._second_scores[:]
+            if len(self._ts) == self._order:#第一段学習
+                score, predict = self._sdar_first.update(x, self._ts, inplace=False)
+                self._add_one(score, _first_scores, self._smooth)
+            self._add_one(x, _ts, self._order)
+            second_target = None
+            if len(_first_scores) == self._smooth:   #平滑化
+                second_target = self._smoothing(_first_scores)
+            if second_target and len(_smoothed_scores) == self._order:   #第二段学習
+                score, predict2 = self._sdar_second.update(second_target,_smoothed_scores,inplace=False)
+                self._add_one(score,
+                              _second_scores,self._smooth2)
+            if second_target:
+                self._add_one(second_target,_smoothed_scores, self._order)
+            if len(_second_scores) == self._smooth2:
+                return self._smoothing2(_second_scores), predict
+            else:
+                return 0.0, predict
 
 
 class ChangeFinderARIMA(_ChangeFinderAbstract):
