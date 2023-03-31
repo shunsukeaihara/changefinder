@@ -53,7 +53,7 @@ class _SDAR_1Dim(object):
             self._c[i] = (1 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
         self._c[0] = (1-self._r)*self._c[0]+self._r * (x-self._mu)*(x-self._mu)
         what, e = LevinsonDurbin(self._c, self._order)
-        xhat = np.dot(-what[1:], (term[::-1] - self._mu))+self._mu
+        xhat = np.dot(what[1:], (term[::-1] - self._mu))+self._mu
         self._sigma = (1-self._r)*self._sigma + self._r * (x-xhat) * (x-xhat)
         return -math.log(math.exp(-0.5*(x-xhat)**2/self._sigma)/((2 * math.pi)**0.5*self._sigma**0.5)), xhat
 
