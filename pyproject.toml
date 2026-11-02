@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "changefinder"
+version = "0.2"
+description = "Online Change-Point Detection Library based on ChangeFinder Algorithm."
+readme = "README.rst"
+license = {text = "MIT License"}
+authors = [{name = "Shunsuke Aihara", email = "aihara@argmax.jp"}]
+keywords = ["scipy", "numpy", "timeseries analysis", "change point detection"]
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "statsmodels>=0.13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/shunsukeaihara/changefinder"
+
+[tool.setuptools]
+packages = ["changefinder"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
