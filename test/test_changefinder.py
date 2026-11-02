@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-import copy
-
 import numpy as np
 import pytest
 
@@ -211,16 +209,11 @@ class TestChangeFinder(object):
     def test_update_not_inplace_leaves_state_untouched(self):
         cf = changefinder.ChangeFinder(r=0.1, order=self._order, smooth=self._smooth)
         _run(cf, self._data[:100])
-        snapshot = copy.deepcopy(cf.__dict__)
+        snapshot = _state(cf)
         peek1 = cf.update(self._data[100], inplace=False)
         peek2 = cf.update(self._data[100], inplace=False)
         assert peek1 == peek2
-        for key, value in snapshot.items():
-            if isinstance(value, changefinder._SDAR_1Dim):
-                for k, v in value.__dict__.items():
-                    np.testing.assert_array_equal(getattr(cf.__dict__[key], k), v)
-            else:
-                assert cf.__dict__[key] == value
+        assert _state(cf) == snapshot
         committed = cf.update(self._data[100])
         assert committed == peek1
 
@@ -233,6 +226,19 @@ class TestChangeFinder(object):
             changefinder.ChangeFinder(r=0.0)
         with pytest.raises(AssertionError):
             changefinder.ChangeFinder(r=1.0)
+
+
+def _state(obj):
+    """Recursively convert a detector's state into plain Python data."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return [_state(o) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _state(v) for k, v in obj.items()}
+    if hasattr(obj, "__dict__"):
+        return _state(vars(obj))
+    return obj
 
 
 def _quiet_scores(scores, change_points, outliers, start=150, window=60):
@@ -298,7 +304,7 @@ class TestChangeFinderNaturalSeries(object):
         for order in (1, 8):
             cf = changefinder.ChangeFinder(r=0.03, order=order, smooth=7)
             _run(cf, x)
-            errors[order] = abs(cf._sdar_first._sigma - 1.0)
+            errors[order] = abs(cf._first._sdar._sigma - 1.0)
         assert errors[1] < errors[8]
 
     @pytest.mark.xfail(reason="empirical: a moderate change of the AR coefficient alone is not reliably "
@@ -361,9 +367,9 @@ class TestChangeFinderARIMA(object):
     def test_update_not_inplace_leaves_state_untouched(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
         _run(cf, self._data[:60])
-        snapshot = copy.deepcopy(cf.__dict__)
+        snapshot = _state(cf)
         peek = cf.update(self._data[60], inplace=False)
-        assert cf.__dict__ == snapshot
+        assert _state(cf) == snapshot
         assert cf.update(self._data[60]) == peek
 
     def test_outlier_score_is_finite_on_constant_history(self):
