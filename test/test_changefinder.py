@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 import changefinder
+from .synthetic import generate_series
 
 
 def _run(detector, data):
@@ -198,6 +199,77 @@ class TestChangeFinder(object):
             changefinder.ChangeFinder(r=1.0)
 
 
+def _quiet_scores(scores, change_points, outliers, start=150, window=60):
+    """Scores outside the windows that follow a change point or an outlier."""
+    excluded = set()
+    for b in list(change_points) + list(outliers):
+        excluded.update(range(b, b + window))
+    return np.array([scores[i] for i in range(start, len(scores)) if i not in excluded])
+
+
+class TestChangeFinderNaturalSeries(object):
+    """
+    Detection on an autocorrelated series with realistic regime changes
+    (see test/synthetic.py).  Notes from tuning these tests:
+
+    * order=1 (or 2) is the sweet spot for natural data.  With forgetting
+      factor r the effective sample size is ~1/r, so higher orders overfit:
+      the residual variance is underestimated, ordinary residuals score too
+      high and the change-point peaks shrink.
+    * A change of the AR dynamics alone (same mean and variance) is not
+      detected by a one-step-ahead AR model, see the xfail test below.
+    * A level shift after a volatile regime is hidden by the inflated
+      variance estimate unless it is large in units of the current sigma.
+    """
+
+    def setup_method(self, method):
+        self._data, self._cps, self._outliers = generate_series(seed=0)
+
+    @pytest.mark.parametrize("r", [0.03, 0.05])
+    def test_detects_regime_changes(self, r):
+        cf = changefinder.ChangeFinder(r=r, order=1, smooth=7)
+        scores, predicts = _run(cf, self._data)
+        assert np.all(np.isfinite(scores))
+        assert np.all(np.isfinite(predicts))
+        quiet = _quiet_scores(scores, self._cps, self._outliers)
+        p99 = np.percentile(quiet, 99)
+        for b in self._cps:
+            window = scores[b:b + 50]
+            peak, lag = window.max(), int(np.argmax(window))
+            assert peak > quiet.max() and peak > 3.0 * p99, (
+                "change point at %d not detected (peak=%f, quiet max=%f, p99=%f)" % (b, peak, quiet.max(), p99))
+            assert lag <= 10, "change point at %d detected too late (lag=%d)" % (b, lag)
+
+    def test_outliers_are_transient(self):
+        cf = changefinder.ChangeFinder(r=0.03, order=1, smooth=7)
+        scores, _ = _run(cf, self._data)
+        quiet = _quiet_scores(scores, self._cps, self._outliers)
+        p99 = np.percentile(quiet, 99)
+        for o in self._outliers:
+            # Whatever a spike scores, the detector is back to normal shortly after.
+            assert scores[o + 20:o + 60].max() < p99, "score did not recover after outlier at %d" % o
+
+    def test_high_order_underestimates_residual_variance(self):
+        x, _, _ = generate_series(seed=0, segments=[(3000, 10.0, 1.0, 0.4)], outliers=[])
+        errors = {}
+        for order in (1, 8):
+            cf = changefinder.ChangeFinder(r=0.03, order=order, smooth=7)
+            _run(cf, x)
+            errors[order] = abs(cf._sdar_first._sigma - 1.0)
+        assert errors[1] < errors[8]
+
+    @pytest.mark.xfail(reason="a change of the AR dynamics alone is not visible to a one-step-ahead AR model",
+                       strict=False)
+    def test_dynamics_only_change(self):
+        x, cps, outliers = generate_series(seed=0, segments=[(400, 10.0, 1.0, 0.4), (400, 10.0, 1.0, -0.5)],
+                                           outliers=[])
+        cf = changefinder.ChangeFinder(r=0.03, order=1, smooth=7)
+        scores, _ = _run(cf, x)
+        quiet = _quiet_scores(scores, cps, outliers)
+        peak = scores[cps[0]:cps[0] + 50].max()
+        assert peak > quiet.max() and peak > 3.0 * np.percentile(quiet, 99)
+
+
 class TestChangeFinderARIMA(object):
     def setup_method(self, method):
         self._term = 30
@@ -225,6 +297,22 @@ class TestChangeFinderARIMA(object):
             assert peak > 100.0 and peak > 10.0 * quiet, (
                 "change point at %d not detected (peak=%f, quiet max=%f)" % (b, peak, quiet))
         assert abs(predicts[100:120].mean() - self._data[100:120].mean()) < 0.5
+
+    def test_detects_regime_changes_on_natural_series(self):
+        segments = [(120, 10.0, 1.0, 0.4), (120, 15.0, 1.0, 0.4), (120, 15.0, 3.0, 0.4), (120, 0.0, 3.0, 0.4)]
+        data, cps, outliers = generate_series(seed=0, segments=segments, outliers=[60, 180, 300, 420])
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+        scores, predicts = _run(cf, data)
+        assert np.all(np.isfinite(scores))
+        assert np.all(np.isfinite(predicts))
+        quiet = _quiet_scores(scores, cps, outliers, start=100, window=40)
+        p99 = np.percentile(quiet, 99)
+        for b in cps:
+            window = scores[b:b + 40]
+            peak, lag = window.max(), int(np.argmax(window))
+            assert peak > quiet.max() and peak > 2.0 * p99, (
+                "change point at %d not detected (peak=%f, quiet max=%f, p99=%f)" % (b, peak, quiet.max(), p99))
+            assert lag <= 10, "change point at %d detected too late (lag=%d)" % (b, lag)
 
     def test_outlier_score_is_finite_on_constant_history(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
