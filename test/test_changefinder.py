@@ -516,6 +516,27 @@ class TestChangeFinderSTS(object):
         b = changes["slope"]
         assert scores[b:b + 30].max() > quiet.max()
 
+    def test_slope_target_detects_large_growth_change(self):
+        for seed in (0, 1):
+            x, changes, _ = generate_daily_series(seed=seed, annual_amplitude=0.0, slope_change=(380, -5.0),
+                                                 level_shift=None, seasonal_change=None, variance_change=None,
+                                                 outliers=())
+            cf = changefinder.ChangeFinderSTS(r=0.01, trend="linear", period=7, target="slope")
+            scores, _ = _run(cf, x)
+            assert np.all(np.isfinite(scores))
+            quiet = scores[150:380]
+            peak = scores[380:560].max()
+            assert peak > 3.0 * quiet.max(), "slope change not detected (peak=%f, quiet=%f)" % (peak, quiet.max())
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderSTS(trend="level", target="slope")
+
+    def test_second_order_zero(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderSTS(r=0.05, trend="linear", period=7, second_order=0)
+        scores, _ = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
+
     def test_outlier_does_not_mask_following_shift(self):
         # With clip=None a 15-sigma spike inflates the variance estimate and
         # hides a 10-sigma level shift 60 steps later; the default clipping keeps it visible.
