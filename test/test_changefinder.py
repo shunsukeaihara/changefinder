@@ -216,8 +216,15 @@ class TestChangeFinderNaturalSeries(object):
       factor r the effective sample size is ~1/r, so higher orders overfit:
       the residual variance is underestimated, ordinary residuals score too
       high and the change-point peaks shrink.
-    * A change of the AR dynamics alone (same mean and variance) is not
-      detected by a one-step-ahead AR model, see the xfail test below.
+    * A change of the AR coefficient alone (same mean and innovation
+      variance) is not discussed in the ChangeFinder papers.  Empirically
+      it is a weak signal for this implementation: with phi changing from
+      0.4 to -0.5 (or 0.6 to -0.6) the peak never exceeded the stationary
+      scores over 6 seeds; even for 0.8 to -0.8 it did so in only about half
+      of the seeds (order 1-2, r 0.03-0.05).  The one-step-ahead residual
+      variance only grows by a factor (1 + (phi_new - phi_old)^2 var(x)),
+      and the SDAR coefficient adapts within ~1/r samples, so the smoothed
+      score ramps up gently instead of jumping.  See the xfail test below.
     * A level shift after a volatile regime is hidden by the inflated
       variance estimate unless it is large in units of the current sigma.
     """
@@ -258,7 +265,8 @@ class TestChangeFinderNaturalSeries(object):
             errors[order] = abs(cf._sdar_first._sigma - 1.0)
         assert errors[1] < errors[8]
 
-    @pytest.mark.xfail(reason="a change of the AR dynamics alone is not visible to a one-step-ahead AR model",
+    @pytest.mark.xfail(reason="empirical: a moderate change of the AR coefficient alone is not reliably "
+                              "detected by this implementation (not a claim of the original papers)",
                        strict=False)
     def test_dynamics_only_change(self):
         x, cps, outliers = generate_series(seed=0, segments=[(400, 10.0, 1.0, 0.4), (400, 10.0, 1.0, -0.5)],
