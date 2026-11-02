@@ -506,7 +506,8 @@ class TestChangeFinderSTS(object):
         for o in outliers:
             assert scores[o:o + 30].max() < 3.0 * p99
 
-    @pytest.mark.xfail(reason="a change of growth rate is too small to see within 30 days at this noise level",
+    @pytest.mark.xfail(reason="a change of growth rate adds only a fraction of the noise sd per step; "
+                              "per-step predictive scores cannot see it, see README",
                        strict=False)
     def test_realistic_daily_series_slope_change(self):
         x, changes, outliers = generate_daily_series(seed=0)
@@ -515,20 +516,6 @@ class TestChangeFinderSTS(object):
         quiet = _quiet_scores(scores, list(changes.values()), outliers, start=120, window=40)
         b = changes["slope"]
         assert scores[b:b + 30].max() > quiet.max()
-
-    def test_slope_target_detects_large_growth_change(self):
-        for seed in (0, 1):
-            x, changes, _ = generate_daily_series(seed=seed, annual_amplitude=0.0, slope_change=(380, -5.0),
-                                                 level_shift=None, seasonal_change=None, variance_change=None,
-                                                 outliers=())
-            cf = changefinder.ChangeFinderSTS(r=0.01, trend="linear", period=7, target="slope")
-            scores, _ = _run(cf, x)
-            assert np.all(np.isfinite(scores))
-            quiet = scores[150:380]
-            peak = scores[380:560].max()
-            assert peak > 3.0 * quiet.max(), "slope change not detected (peak=%f, quiet=%f)" % (peak, quiet.max())
-        with pytest.raises(AssertionError):
-            changefinder.ChangeFinderSTS(trend="level", target="slope")
 
     def test_second_order_zero(self):
         x, _, _ = _trend_seasonal_series()

@@ -68,6 +68,11 @@ Notes:
   overfit.
 * Scores start after a warm-up (``1 / r`` observations for SDAR, at least
   two periods for ``ChangeFinderSTS``, four periods for ``ChangeFinderSTL``).
+* A change of the growth rate (a kink in the trend) is not detected unless
+  the slope changes by about the noise standard deviation per step. Its
+  evidence accumulates over many steps while every detector here scores
+  one step at a time, and the trend state of ``ChangeFinderSTS`` tracks
+  the new slope. Use a window-based slope test or a CUSUM for that.
 
 Test
 ----

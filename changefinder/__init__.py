@@ -268,8 +268,6 @@ class _ChangeFinderAbstract(object):
         if len(self._first_scores) < self._smooth:
             return 0.0, predict
         second_target = self._smoothing(self._first_scores)
-        if self._second is None:
-            return second_target, predict
         second = self._second.score(second_target)
         if second is None:
             return 0.0, predict
@@ -585,48 +583,6 @@ class _DiscountKalman1Dim(object):
         return out
 
 
-class _SlopeScorer(object):
-    """
-    Scores the drift of the Kalman slope estimate.
-
-    A change of the growth rate barely shows in the one-step residual,
-    because the slope state tracks it; what moves is the slope estimate
-    itself.  The score is ``0.5 * z^2`` with ``z = (slope_t - mu) /
-    sqrt(Var(slope_t))``: the deviation of the slope from a slowly
-    forgetting reference ``mu`` (forgetting factor ``r``), standardized by
-    the filter's posterior slope variance.
-    """
-
-    def __init__(self, kalman, r):
-        assert kalman._trend == "linear", "target='slope' needs trend='linear'."
-        self._kalman = kalman
-        self._r = r
-        self._mu = None
-        self._t = 0
-
-    @property
-    def warmup(self):
-        return self._kalman.warmup
-
-    def components(self):
-        return self._kalman.components()
-
-    def score(self, x):
-        result = self._kalman.update(x)
-        if result is None:
-            return None
-        slope = float(self._kalman._m[1])
-        var = max(float(self._kalman._C[1, 1]), _EPS)
-        if self._mu is None:
-            self._mu = slope
-            return None
-        z2 = (slope - self._mu) ** 2 / var
-        r = max(self._r, 1.0 / (self._t + 1.0))
-        self._t += 1
-        self._mu = (1.0 - r) * self._mu + r * slope
-        return 0.5 * z2, result[1]
-
-
 class ChangeFinderSTS(_ChangeFinderAbstract):
     """
     ChangeFinder with a structural time series model (level, optional
@@ -651,10 +607,9 @@ class ChangeFinderSTS(_ChangeFinderAbstract):
         Discount factor(s) for the state blocks ``level``, ``slope``,
         ``seasonal``: how fast each component may drift (0.95 lets the
         level move noticeably within ~20 steps; 0.98-0.99 is stiffer).
-    second_order : int or None
+    second_order : int
         AR order of the second-stage SDAR on the smoothed scores (default
-        1; 0 uses no AR term, only the forgetting mean).  Unused for
-        ``target="slope"``.
+        1; 0 uses no AR term, only the forgetting mean).
     clip : float or None
         Residuals beyond ``clip`` predictive standard deviations are
         winsorized in the learning step (not in the score), so an outlier
@@ -665,40 +620,14 @@ class ChangeFinderSTS(_ChangeFinderAbstract):
         The median passes sustained changes but not isolated spikes, which
         keeps outliers from dominating the change-point score; "mean" is
         the original ChangeFinder smoothing.
-    target : "residual" | "slope"
-        "residual": the usual two-stage score of the one-step predictive
-        log-loss (level shifts, variance and seasonal changes).  "slope"
-        (requires ``trend="linear"``): a single-stage score of how far the
-        estimated slope has drifted from its slowly forgetting reference,
-        standardized by the filter's slope variance.  Growth-rate changes
-        barely show in the residual because the slope state tracks them;
-        this target sees them, but only when the change is large compared
-        with the noise and with the natural slope variation (an annual
-        cycle, for instance), and with a lag of weeks.  Use a small ``r``
-        (0.01 or less) so the reference moves slower than the slope.
-
-    The first ``warmup`` observations (at least ``2 * period``) fit the
-    model by least squares and score 0.0.  Scores are the negative
-    log-likelihood of the one-step-ahead predictive distribution, whose
-    variance includes the state uncertainty, so no random initialization
-    and no burn-in spike.
     """
 
     def __init__(self, r=0.05, smooth=7, trend="level", period=None, harmonics=None,
-                 discount=0.95, second_order=None, clip=3.0, smoothing="median", target="residual"):
-        assert target in ("residual", "slope"), "target must be 'residual' or 'slope'."
+                 discount=0.95, second_order=1, clip=3.0, smoothing="median"):
         self._r = r
         first = _DiscountKalman1Dim(r, trend=trend, period=period, harmonics=harmonics,
                                     discount=discount, clip=clip)
-        self._target = target
-        if target == "slope":
-            # One stage: the slope deviation is already a smooth statistic,
-            # so it is only median/mean smoothed and returned.
-            self._init_stages(smooth, _SlopeScorer(first, r), None, smoothing)
-        else:
-            if second_order is None:
-                second_order = 1
-            self._init_stages(smooth, first, _SDARScorer(r, second_order, clip), smoothing)
+        self._init_stages(smooth, first, _SDARScorer(r, second_order, clip), smoothing)
 
     @property
     def warmup(self):
