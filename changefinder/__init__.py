@@ -7,7 +7,7 @@ import numpy as np
 from scipy import stats
 from statsmodels.tsa.arima.model import ARIMA
 
-__version__ = "0.2"
+__version__ = "0.4"
 
 # Lower bound for variances. Keeps log-likelihood computations finite when a
 # series becomes (nearly) perfectly predictable and the estimated variance

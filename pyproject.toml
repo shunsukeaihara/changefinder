@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "changefinder"
-version = "0.2"
+version = "0.4"
 description = "Online Change-Point Detection Library based on ChangeFinder Algorithm."
 readme = "README.rst"
 license = {text = "MIT License"}
