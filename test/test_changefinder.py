@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import copy
+
 import numpy as np
 import pytest
 
@@ -89,6 +91,24 @@ class TestSDAR(object):
         assert abs(sdar._mu - mu) < 0.3
         assert abs(-a[1] - phi) < 0.05
         assert abs(sdar._sigma - var) < 0.05
+
+    def test_prediction_exploits_autocorrelation(self):
+        # Guards the sign of the AR coefficients in the prediction: with the
+        # sign flipped the forecast would be anti-correlated with the series
+        # and its residuals larger than the series' own variance.
+        rng = np.random.RandomState(0)
+        phi, n = 0.7, 5000
+        x = np.zeros(n)
+        e = rng.normal(size=n)
+        for t in range(1, n):
+            x[t] = phi * x[t - 1] + e[t]
+        sdar = changefinder._SDAR_1Dim(0.02, 1)
+        resid = []
+        for t in range(1, n):
+            _, xhat = sdar.update(x[t], [x[t - 1]])
+            if t > 500:
+                resid.append(x[t] - xhat)
+        assert np.var(resid) < 0.6 * np.var(x[500:])
 
     def test_score_is_negative_gaussian_log_likelihood(self):
         from scipy import stats
@@ -187,6 +207,22 @@ class TestChangeFinder(object):
         scores, _ = _run(cf, data)
         assert np.all(np.isfinite(scores))
         assert np.argmax(scores) >= 200
+
+    def test_update_not_inplace_leaves_state_untouched(self):
+        cf = changefinder.ChangeFinder(r=0.1, order=self._order, smooth=self._smooth)
+        _run(cf, self._data[:100])
+        snapshot = copy.deepcopy(cf.__dict__)
+        peek1 = cf.update(self._data[100], inplace=False)
+        peek2 = cf.update(self._data[100], inplace=False)
+        assert peek1 == peek2
+        for key, value in snapshot.items():
+            if isinstance(value, changefinder._SDAR_1Dim):
+                for k, v in value.__dict__.items():
+                    np.testing.assert_array_equal(getattr(cf.__dict__[key], k), v)
+            else:
+                assert cf.__dict__[key] == value
+        committed = cf.update(self._data[100])
+        assert committed == peek1
 
     def test_invalid_parameters(self):
         with pytest.raises(AssertionError):
@@ -321,6 +357,14 @@ class TestChangeFinderARIMA(object):
             assert peak > quiet.max() and peak > 2.0 * p99, (
                 "change point at %d not detected (peak=%f, quiet max=%f, p99=%f)" % (b, peak, quiet.max(), p99))
             assert lag <= 10, "change point at %d detected too late (lag=%d)" % (b, lag)
+
+    def test_update_not_inplace_leaves_state_untouched(self):
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+        _run(cf, self._data[:60])
+        snapshot = copy.deepcopy(cf.__dict__)
+        peek = cf.update(self._data[60], inplace=False)
+        assert cf.__dict__ == snapshot
+        assert cf.update(self._data[60]) == peek
 
     def test_outlier_score_is_finite_on_constant_history(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)

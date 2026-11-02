@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import copy
 import math
 import warnings
 
@@ -125,6 +126,18 @@ class _SDAR_1Dim(object):
 
 
 class _ChangeFinderAbstract(object):
+    def update(self, x, inplace=True):
+        """
+        Feed one observation and return ``(score, predict)``.
+
+        With ``inplace=False`` the score is computed for ``x`` without
+        learning it: the detector's state is left untouched, so repeated
+        calls with the same observation return the same result.
+        """
+        if not inplace:
+            return copy.deepcopy(self)._update(x)
+        return self._update(x)
+
     def _add_one(self, one, ts, size):
         ts.append(one)
         if len(ts) == size + 1:
@@ -149,7 +162,7 @@ class ChangeFinder(_ChangeFinderAbstract):
         self._sdar_first = _SDAR_1Dim(r, self._order)
         self._sdar_second = _SDAR_1Dim(r, self._order)
 
-    def update(self, x):
+    def _update(self, x):
         score = 0
         predict = x
         predict2 = 0
@@ -202,7 +215,7 @@ class ChangeFinderARIMA(_ChangeFinderAbstract):
         resid = np.asarray(result.resid, dtype=np.float64)
         return outlier_score(resid, x=target - pred), pred
 
-    def update(self, x):
+    def _update(self, x):
         score = 0
         predict = x
         predict2 = 0
