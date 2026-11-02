@@ -9,7 +9,7 @@ from statsmodels.tsa.arima.model import ARIMA
 
 from .onlinestl import OnlineSTL
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 # Lower bound for variances. Keeps log-likelihood computations finite when a
 # series becomes (nearly) perfectly predictable and the estimated variance
