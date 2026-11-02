@@ -21,7 +21,9 @@ def _assert_change_points_detected(scores, boundaries, window=40, quiet_offset=8
     for b in boundaries:
         peak = scores[b:b + window].max()
         quiet = scores[b + quiet_offset:b + 280]
-        assert peak > quiet.max() + 0.5 and peak > quiet.mean() + 4.0 * quiet.std(), (
+        # The log-loss of an unseen level shift is orders of magnitude above
+        # the scores produced by ordinary noise.
+        assert peak > 100.0 and peak > 10.0 * quiet.max(), (
             "change point at %d not detected (peak=%f, quiet max=%f, quiet mean=%f, quiet std=%f)"
             % (b, peak, quiet.max(), quiet.mean(), quiet.std()))
 
@@ -92,10 +94,26 @@ class TestSDAR(object):
         rng = np.random.RandomState(0)
         xs = rng.normal(size=50)
         sdar = changefinder._SDAR_1Dim(0.1, 2)
-        for t in range(2, 50):
-            score, xhat = sdar.update(xs[t], xs[t - 2:t])
-        ref = -stats.norm.logpdf(xs[49], loc=xhat, scale=np.sqrt(sdar._sigma))
+        for t in range(2, 49):
+            sdar.update(xs[t], xs[t - 2:t])
+        # The score of x_t uses the variance (and prediction) learned from
+        # x_1 .. x_{t-1}, i.e. the state before x_t is learned.
+        sigma_prev = sdar._sigma
+        score, xhat = sdar.update(xs[49], xs[47:49])
+        ref = -stats.norm.logpdf(xs[49], loc=xhat, scale=np.sqrt(sigma_prev))
         np.testing.assert_allclose(score, ref)
+
+    def test_scores_before_learning(self):
+        # A step that the model has not seen yet must be scored as surprising,
+        # even though learning it immediately afterwards would absorb it.
+        sdar = changefinder._SDAR_1Dim(0.5, 1)
+        rng = np.random.RandomState(0)
+        xs = rng.normal(size=100)
+        for t in range(1, 100):
+            sdar.update(xs[t], [xs[t - 1]])
+        typical, _ = sdar.update(0.5, [xs[-1]])
+        surprising, _ = sdar.update(50.0, [0.5])
+        assert surprising > typical + 100.0
 
 
 class TestChangeFinder(object):
@@ -143,7 +161,7 @@ class TestChangeFinder(object):
         # The first steps return 0.0 until the buffers are filled.
         assert np.all(scores[:self._order * 2 + self._smooth] == 0.0)
         # After burn-in nothing should look like a change.
-        assert scores[100:].max() < 1.0
+        assert scores[100:].max() < 20.0
 
     @pytest.mark.parametrize("order", [1, 2, 3, 5])
     @pytest.mark.parametrize("name", ["constant", "zeros", "alternating", "step", "huge", "tiny"])
@@ -204,7 +222,7 @@ class TestChangeFinderARIMA(object):
         for b in self._boundaries:
             peak = scores[b:b + 40].max()
             quiet = scores[b + 60:b + 110].max()
-            assert peak > quiet + 1.0, (
+            assert peak > 100.0 and peak > 10.0 * quiet, (
                 "change point at %d not detected (peak=%f, quiet max=%f)" % (b, peak, quiet))
         assert abs(predicts[100:120].mean() - self._data[100:120].mean()) < 0.5
 

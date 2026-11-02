@@ -66,36 +66,61 @@ def LevinsonDurbin(r, lpcOrder):
 
 
 class _SDAR_1Dim(object):
+    """
+    Sequentially Discounting AR model estimation (Yamanishi & Takeuchi).
+
+    ``update(x_t, term)`` scores ``x_t`` with the model learned from
+    ``x_1 .. x_{t-1}`` (``-log p_{t-1}(x_t | x^{t-1})``) and then updates the
+    model with ``x_t``.  ``term`` holds the ``order`` previous observations.
+    """
+
     def __init__(self, r, order):
         assert 0.0 < r < 1.0, "r must be in (0, 1)."
         self._r = r
+        self._order = order
         self._mu = 0.0
         self._sigma = 0.0
-        self._order = order
         self._c = np.zeros(self._order + 1, dtype=np.float64)
+        self._a = np.zeros(self._order + 1, dtype=np.float64)
+        self._a[0] = 1.0
         self._initialized = False
+
+    def _predict(self, term):
+        return np.dot(-self._a[1:], (term[::-1] - self._mu)) + self._mu
+
+    def _score(self, x, xhat):
+        resid = x - xhat
+        sigma = max(self._sigma, _EPS)
+        # Negative Gaussian log-likelihood, evaluated in log space so that it
+        # never overflows/underflows.
+        return 0.5 * math.log(2.0 * math.pi * sigma) + 0.5 * resid * resid / sigma
+
+    def _learn(self, x, term):
+        self._mu = (1.0 - self._r) * self._mu + self._r * x
+        self._c[0] = (1.0 - self._r) * self._c[0] + self._r * (x - self._mu) * (x - self._mu)
+        for i in range(1, self._order + 1):
+            self._c[i] = (1.0 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
+        self._a, _ = LevinsonDurbin(self._c, self._order)
+        xhat = self._predict(term)
+        resid = x - xhat
+        self._sigma = (1.0 - self._r) * self._sigma + self._r * resid * resid
+        return xhat
 
     def update(self, x, term):
         assert len(term) >= self._order, "term must be order or more"
         term = np.asarray(term, dtype=np.float64)[-self._order:]
         x = float(x)
         if not self._initialized:
-            # Start from the observed level instead of a random guess so that
-            # results are deterministic and the burn-in transient is small.
-            self._mu = float(np.mean(np.append(term, x)))
+            # No model has been learned yet: start from the level of the
+            # history, learn x_t and bootstrap the first score from that model.
+            self._mu = float(np.mean(term))
             self._initialized = True
-        self._mu = (1.0 - self._r) * self._mu + self._r * x
-        self._c[0] = (1.0 - self._r) * self._c[0] + self._r * (x - self._mu) * (x - self._mu)
-        for i in range(1, self._order + 1):
-            self._c[i] = (1.0 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
-        what, _ = LevinsonDurbin(self._c, self._order)
-        xhat = np.dot(-what[1:], (term[::-1] - self._mu)) + self._mu
-        resid = x - xhat
-        self._sigma = (1.0 - self._r) * self._sigma + self._r * resid * resid
-        sigma = max(self._sigma, _EPS)
-        # Negative Gaussian log-likelihood, evaluated in log space so that it
-        # never overflows/underflows.
-        score = 0.5 * math.log(2.0 * math.pi * sigma) + 0.5 * resid * resid / sigma
+            xhat = self._learn(x, term)
+            return self._score(x, xhat), xhat
+        # Score x_t under p_{t-1}, then learn x_t.
+        xhat = self._predict(term)
+        score = self._score(x, xhat)
+        self._learn(x, term)
         return score, xhat
 
 
