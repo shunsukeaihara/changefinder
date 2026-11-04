@@ -151,9 +151,10 @@ two-stage structure above; they differ in the first-stage model.
        daily or weekly business and operations metrics.
    * - ``ChangeFinderARIMA``
      - A (seasonal) ARIMA model refitted on the last ``term`` points at
-       every step (``order``, ``seasonal_order``, ``trend``)
-     - When an explicit SARIMA specification is wanted. Slow: one
-       maximum-likelihood fit per observation and stage.
+       every step (``order``, ``seasonal_order``, ``trend``), scored with
+       its forecast distribution; SDAR in the second stage
+     - When an explicit SARIMA specification (MA terms, seasonal AR) is
+       wanted. Slow: one maximum-likelihood fit per observation.
 
 Parameters
 ----------
@@ -202,6 +203,12 @@ SDAR based detectors (``ChangeFinder``, ``ChangeFinderSI``, ``ChangeFinderSTL``)
     Forgetting factor of the observation-noise variance and of the
     second-stage SDAR.
 
+``ChangeFinderARIMA``:
+
+``term``
+    Window length of the refit. ``r`` and ``second_order`` configure the
+    second-stage SDAR.
+
 ``ChangeFinderSTL``:
 
 ``periods``
@@ -240,8 +247,14 @@ Limitations
 * Scores are log-likelihood ratios, not probabilities: their scale depends
   on the model and the data, so thresholds have to be calibrated on a
   stationary stretch of the series.
-* The ARIMA detector swallows a failed fit (returning a zero score) after
-  warning once; make ``term`` several times the seasonal period.
+* ``ChangeFinderARIMA`` is not a sequentially discounting model: it refits
+  on a fixed window of ``term`` observations, so old data drops out
+  abruptly instead of fading, and one maximum-likelihood fit per
+  observation makes it one to two orders of magnitude slower than the
+  other detectors. Make ``term`` several times the seasonal period. When a
+  fit fails numerically, the parameters of the last successful fit are
+  applied to the current window (a warning is issued once and
+  ``fit_failures`` counts these steps).
 
 Development
 -----------

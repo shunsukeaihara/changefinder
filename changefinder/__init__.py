@@ -173,9 +173,17 @@ class _SDARScorer(object):
 
 
 class _ARIMAScorer(object):
-    """Scorer that refits an ARIMA model on the last ``term`` values."""
+    """
+    Scorer that refits a (seasonal) ARIMA model on the last ``term`` values
+    and scores the next one with its one-step forecast distribution.
 
-    def __init__(self, term, order, seasonal_order=(0, 0, 0, 0), trend=None):
+    If a fit fails, the parameters of the last successful fit are applied
+    to the current window instead (no re-estimation); the number of such
+    steps is counted in ``fit_failures``.  Observations stored in the
+    window are winsorized at ``clip`` forecast standard errors.
+    """
+
+    def __init__(self, term, order, seasonal_order=(0, 0, 0, 0), trend=None, clip=3.0):
         p, d, q = order
         P, D, Q, s = seasonal_order
         if s == 0:
@@ -183,42 +191,62 @@ class _ARIMAScorer(object):
         needed = p + d + q + s * (P + D + Q) + 10
         assert term >= needed, "term must be at least %d for order=%s, seasonal_order=%s" % (
             needed, order, seasonal_order)
+        assert clip is None or clip > 0, "clip must be positive or None."
         self._term = term
         self._order = tuple(order)
         self._seasonal_order = tuple(seasonal_order)
         self._trend = trend
+        self._clip = clip
         self._ts = []
+        self._last = None
         self._warned = False
+        self.fit_failures = 0
 
-    def _calc_outlier_score(self, ts, target):
-        def outlier_score(residuals, x):
-            m = residuals.mean()
-            s = np.std(residuals, ddof=1)
-            if not np.isfinite(s) or s < math.sqrt(_EPS):
-                s = math.sqrt(_EPS)
-            return -stats.norm.logpdf(x, m, s)
-        ts = np.asarray(ts, dtype=np.float64)
+    def _fit(self, ts):
+        error = None
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            arima_model = ARIMA(ts, order=self._order, seasonal_order=self._seasonal_order,
-                                trend=self._trend)
-            result = arima_model.fit()
-            pred = float(np.asarray(result.forecast(1)).ravel()[0])
-        resid = np.asarray(result.resid, dtype=np.float64)
-        return outlier_score(resid, x=target - pred), pred
+            warnings.simplefilter("ignore")  # convergence chatter from statsmodels
+            model = ARIMA(ts, order=self._order, seasonal_order=self._seasonal_order, trend=self._trend)
+            try:
+                result = model.fit()
+            except Exception as exc:  # numerical trouble on this window
+                error = exc
+                result = None if self._last is None else self._last.apply(ts)
+            else:
+                self._last = result
+            if result is not None:
+                forecast = result.get_forecast(1)
+                mean = float(np.asarray(forecast.predicted_mean).ravel()[0])
+                se = float(np.asarray(forecast.se_mean).ravel()[0])
+        if error is not None:
+            self.fit_failures += 1
+            if not self._warned:
+                self._warned = True
+                if result is None:
+                    warnings.warn("ARIMA fit failed before any fit succeeded; no score for this step: %r"
+                                  % (error,), RuntimeWarning)
+                else:
+                    warnings.warn("ARIMA fit failed, reusing the parameters of the last successful fit: %r"
+                                  % (error,), RuntimeWarning)
+        if result is None:
+            return None
+        if not np.isfinite(se) or se < math.sqrt(_EPS):
+            se = math.sqrt(_EPS)
+        return mean, se
 
     def score(self, x):
+        x = float(x)
         result = None
+        stored = x
         if len(self._ts) == self._term:
-            try:
-                result = self._calc_outlier_score(self._ts, x)
-            except Exception as exc:  # the model could not be fitted on this window
-                if not self._warned:
-                    warnings.warn("ARIMA fit failed, returning a zero score: %r" % (exc,),
-                                  RuntimeWarning)
-                    self._warned = True
-                result = None
-        self._ts.append(x)
+            fit = self._fit(np.asarray(self._ts, dtype=np.float64))
+            if fit is not None:
+                mean, se = fit
+                result = (float(-stats.norm.logpdf(x, mean, se)), mean)
+                if self._clip is not None:
+                    bound = self._clip * se
+                    stored = mean + max(-bound, min(bound, x - mean))
+        self._ts.append(stored)
         if len(self._ts) > self._term:
             self._ts.pop(0)
         return result
@@ -340,28 +368,39 @@ class ChangeFinderSI(ChangeFinder):
 
 class ChangeFinderARIMA(_ChangeFinderAbstract):
     """
-    ChangeFinder that refits a (seasonal) ARIMA model on the last ``term``
-    observations at every step.
+    ChangeFinder whose first stage refits a (seasonal) ARIMA model on the
+    last ``term`` observations at every step and scores the next one with
+    the forecast distribution; the second stage is SDAR on the smoothed
+    scores.
 
-    ``order=(p, d, q)`` and ``seasonal_order=(P, D, Q, s)`` are passed to
-    statsmodels' ARIMA; ``trend`` is one of ``'n'``, ``'c'``, ``'t'``,
-    ``'ct'`` or None for the statsmodels default.  The second stage models
-    the smoothed scores with the non-seasonal ``second_order`` (default:
-    ``order``).  With the default arguments this is the original
-    ChangeFinderARIMA.
+    ``order=(p, d, q)``, ``seasonal_order=(P, D, Q, s)`` and ``trend``
+    (``'n'``, ``'c'``, ``'t'``, ``'ct'`` or None for the statsmodels
+    default) are passed to statsmodels' ARIMA.  ``r`` and ``second_order``
+    configure the second-stage SDAR.  ``clip`` winsorizes the observations
+    kept in the window (and the second-stage learning) at that many
+    forecast standard errors.
+
+    This detector uses a fixed window, not the sequential discounting of
+    the other detectors, and performs one maximum-likelihood fit per
+    observation, so it is slow.  ``fit_failures`` counts the steps on which
+    the fit failed and the previous parameters were reused.
     """
 
     def __init__(self, term=30, smooth=7, order=(1, 0, 0), seasonal_order=(0, 0, 0, 0),
-                 trend=None, second_order=None, smoothing="mean"):
+                 trend=None, r=0.05, second_order=1, clip=3.0, smoothing="mean"):
         assert term > smooth, "term must be more than smooth"
         self._term = term
         self._order = tuple(order)
         self._seasonal_order = tuple(seasonal_order)
         self._trend = trend
-        second_order = tuple(order if second_order is None else second_order)
+        self._r = r
         self._init_stages(smooth,
-                          _ARIMAScorer(term, self._order, self._seasonal_order, trend),
-                          _ARIMAScorer(term, second_order), smoothing)
+                          _ARIMAScorer(term, self._order, self._seasonal_order, trend, clip),
+                          _SDARScorer(r, second_order, clip), smoothing)
+
+    @property
+    def fit_failures(self):
+        return self._first.fit_failures
 
 
 class ChangeFinderSTL(ChangeFinder):

@@ -236,6 +236,8 @@ def _state(obj):
         return [_state(o) for o in obj]
     if isinstance(obj, dict):
         return {k: _state(v) for k, v in obj.items()}
+    if type(obj).__module__.startswith("statsmodels"):
+        return "<%s>" % type(obj).__name__   # fitted results carry lazy caches
     if hasattr(obj, "__dict__"):
         return _state(vars(obj))
     return obj
@@ -372,6 +374,40 @@ class TestChangeFinderARIMA(object):
         assert _state(cf) == snapshot
         assert cf.update(self._data[60]) == peek
 
+    def test_failed_fit_reuses_previous_parameters(self):
+        import statsmodels.tsa.arima.model as arima_model
+        original_fit = arima_model.ARIMA.fit
+        calls = {"n": 0}
+
+        def flaky_fit(model, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise ValueError("forced failure")
+            return original_fit(model, *args, **kwargs)
+
+        arima_model.ARIMA.fit = flaky_fit
+        try:
+            cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+            with pytest.warns(RuntimeWarning, match="reusing"):
+                scores, predicts = _run(cf, self._data[:150])
+        finally:
+            arima_model.ARIMA.fit = original_fit
+        assert np.all(np.isfinite(scores)) and np.all(np.isfinite(predicts))
+        assert cf.fit_failures == 150 - self._term - 1
+        assert np.any(scores[self._term + 2 * self._smooth:] != 0.0)
+
+    def test_window_is_winsorized(self):
+        rng = np.random.RandomState(0)
+        x = rng.normal(size=80) + 5
+        x[50] += 50.0
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+        _run(cf, x[:51])
+        stored = cf._first._ts[-1]
+        assert abs(stored - 5.0) < 10.0 < abs(x[50] - 5.0)
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order, clip=None)
+        _run(cf, x[:51])
+        assert cf._first._ts[-1] == x[50]
+
     def test_outlier_score_is_finite_on_constant_history(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
         scores, predicts = _run(cf, np.ones(100))
@@ -383,6 +419,10 @@ class TestChangeFinderARIMA(object):
             changefinder.ChangeFinderARIMA(smooth=2)
         with pytest.raises(AssertionError):
             changefinder.ChangeFinderARIMA(term=5, smooth=7)
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderARIMA(term=15, smooth=7, seasonal_order=(0, 1, 0, 7))
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderARIMA(seasonal_order=(1, 0, 0, 0))
 
 
 def _trend_seasonal_series(seed=0, n=700, period=7, noise=0.5, shift=(400, 5.0)):
