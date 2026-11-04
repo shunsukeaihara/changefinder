@@ -68,6 +68,32 @@ same value twice or to ask "what if", pass ``inplace=False``:
 
     score, predict = cf.update(x, inplace=False)   # state unchanged
 
+Piecewise-stationary series
+---------------------------
+
+The setting of the original ChangeFinder papers: a stationary process whose
+mean or variance changes abruptly, with a few isolated outliers mixed in.
+Here an AR(1) process gets a level shift, a change of the noise level and a
+second level shift, plus four spikes:
+
+.. code-block:: python
+
+    cf = changefinder.ChangeFinder(r=0.03, order=1, smooth=7)
+    for x in data:
+        score, predict = cf.update(x)
+
+.. image:: https://raw.githubusercontent.com/shunsukeaihara/changefinder/main/docs/images/basic_example.png
+   :alt: ChangeFinder on a piecewise-stationary AR(1) series
+   :width: 100%
+
+Each regime change produces a sharp peak three steps after it happens (the
+lag of the smoothing windows). The spikes score lower than the changes
+because the smoothing dilutes a single surprising observation, but they
+are not invisible: with ``r=0.03`` a 4-sigma spike reaches a score of
+about 5 to 9 against change-point peaks of 14 to 130. The series after the
+third change also shows the score settling back as the model adapts to the
+new regime.
+
 Series with trend and seasonality
 ---------------------------------
 
@@ -225,9 +251,9 @@ Development
     pip install .[test]
     pytest
 
-``test/synthetic.py`` contains the generators used by the tests: an AR(1)
-series with level and variance shifts and outliers, and the daily metric of
-the figure above (``generate_daily_series``).
+``test/synthetic.py`` contains the generators used by the tests and in the
+figures above: ``generate_series`` (the piecewise-stationary AR(1) series)
+and ``generate_daily_series`` (the daily metric).
 
 References
 ----------
