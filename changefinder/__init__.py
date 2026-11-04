@@ -7,7 +7,9 @@ import numpy as np
 from scipy import stats
 from statsmodels.tsa.arima.model import ARIMA
 
-__version__ = "0.4"
+from .onlinestl import OnlineSTL
+
+__version__ = "0.5"
 
 # Lower bound for variances. Keeps log-likelihood computations finite when a
 # series becomes (nearly) perfectly predictable and the estimated variance
@@ -73,11 +75,16 @@ class _SDAR_1Dim(object):
     ``update(x_t, term)`` scores ``x_t`` with the model learned from
     ``x_1 .. x_{t-1}`` (``-log p_{t-1}(x_t | x^{t-1})``) and then updates the
     model with ``x_t``.  ``term`` holds the ``order`` previous observations.
+    The first ``ceil(1 / r)`` observations are learned with plain averages
+    (warm start) and return ``None`` instead of a score.
     """
 
-    def __init__(self, r, order):
+    def __init__(self, r, order, clip=3.0):
         assert 0.0 < r < 1.0, "r must be in (0, 1)."
+        assert order >= 0, "order must be 0 or more."
+        assert clip is None or clip > 0, "clip must be positive or None."
         self._r = r
+        self._clip = clip
         self._order = order
         self._mu = 0.0
         self._sigma = 0.0
@@ -85,6 +92,9 @@ class _SDAR_1Dim(object):
         self._a = np.zeros(self._order + 1, dtype=np.float64)
         self._a[0] = 1.0
         self._initialized = False
+        self._t = 0
+        # Learn only (no score) until the plain-average warm start is over.
+        self.warmup = max(2, int(math.ceil(1.0 / r)))
 
     def _predict(self, term):
         return np.dot(-self._a[1:], (term[::-1] - self._mu)) + self._mu
@@ -97,35 +107,173 @@ class _SDAR_1Dim(object):
         return 0.5 * math.log(2.0 * math.pi * sigma) + 0.5 * resid * resid / sigma
 
     def _learn(self, x, term):
-        self._mu = (1.0 - self._r) * self._mu + self._r * x
-        self._c[0] = (1.0 - self._r) * self._c[0] + self._r * (x - self._mu) * (x - self._mu)
+        # Warm start: plain averages until 1 / r observations have been seen,
+        # then exponential forgetting with r.
+        r = max(self._r, 1.0 / (self._t + 1.0))
+        self._t += 1
+        self._mu = (1.0 - r) * self._mu + r * x
+        self._c[0] = (1.0 - r) * self._c[0] + r * (x - self._mu) * (x - self._mu)
         for i in range(1, self._order + 1):
-            self._c[i] = (1.0 - self._r) * self._c[i] + self._r * (x - self._mu) * (term[-i] - self._mu)
-        self._a, _ = LevinsonDurbin(self._c, self._order)
+            self._c[i] = (1.0 - r) * self._c[i] + r * (x - self._mu) * (term[-i] - self._mu)
+        if self._order > 0:
+            self._a, _ = LevinsonDurbin(self._c, self._order)
         xhat = self._predict(term)
         resid = x - xhat
-        self._sigma = (1.0 - self._r) * self._sigma + self._r * resid * resid
+        self._sigma = (1.0 - r) * self._sigma + r * resid * resid
         return xhat
 
     def update(self, x, term):
         assert len(term) >= self._order, "term must be order or more"
-        term = np.asarray(term, dtype=np.float64)[-self._order:]
+        term = np.asarray(term, dtype=np.float64)[len(term) - self._order:]
         x = float(x)
         if not self._initialized:
             # No model has been learned yet: start from the level of the
-            # history, learn x_t and bootstrap the first score from that model.
-            self._mu = float(np.mean(term))
+            # history (or of x_t for order 0) and learn x_t.
+            self._mu = float(np.mean(term)) if self._order > 0 else x
             self._initialized = True
-            xhat = self._learn(x, term)
-            return self._score(x, xhat), xhat
-        # Score x_t under p_{t-1}, then learn x_t.
+            self._learn(x, term)
+            return None
+        if self._t < self.warmup:
+            # Warm start: plain averages are still being accumulated, the
+            # variance estimate is not established yet, so learn without
+            # scoring.
+            self._learn(x, term)
+            return None
+        # Score x_t under p_{t-1}, then learn x_t.  The learning step sees a
+        # winsorized observation (residual clipped at ``clip`` predictive
+        # standard deviations) so that one outlier does not inflate the
+        # variance estimate and mask the changes that follow.
         xhat = self._predict(term)
         score = self._score(x, xhat)
+        if self._clip is not None and self._t * self._r >= 1.0:
+            # Only once the warm start is over and the scale is established.
+            bound = self._clip * math.sqrt(max(self._sigma, _EPS))
+            x = xhat + max(-bound, min(bound, x - xhat))
         self._learn(x, term)
         return score, xhat
 
 
+class _SDARScorer(object):
+    """First/second-stage scorer: SDAR on a window of ``order`` past values."""
+
+    def __init__(self, r, order, clip=3.0):
+        assert order >= 0, "order must be 0 or more (0: no AR term, residual from the forgetting mean)."
+        self._order = order
+        self._ts = []
+        self._sdar = _SDAR_1Dim(r, order, clip)
+
+    def score(self, x):
+        result = None
+        if len(self._ts) == self._order:
+            result = self._sdar.update(x, self._ts)
+        self._ts.append(x)
+        if len(self._ts) > self._order:
+            self._ts.pop(0)
+        return result
+
+
+class _ARIMAScorer(object):
+    """
+    Scorer that refits a (seasonal) ARIMA model on the last ``term`` values
+    and scores the next one with its one-step forecast distribution.
+
+    If a fit fails, the parameters of the last successful fit are applied
+    to the current window instead (no re-estimation); the number of such
+    steps is counted in ``fit_failures``.  Observations stored in the
+    window are winsorized at ``clip`` forecast standard errors.
+    """
+
+    def __init__(self, term, order, seasonal_order=(0, 0, 0, 0), trend=None, clip=3.0):
+        p, d, q = order
+        P, D, Q, s = seasonal_order
+        if s == 0:
+            assert (P, D, Q) == (0, 0, 0), "seasonal_order needs a period s > 0."
+        needed = p + d + q + s * (P + D + Q) + 10
+        assert term >= needed, "term must be at least %d for order=%s, seasonal_order=%s" % (
+            needed, order, seasonal_order)
+        assert clip is None or clip > 0, "clip must be positive or None."
+        self._term = term
+        self._order = tuple(order)
+        self._seasonal_order = tuple(seasonal_order)
+        self._trend = trend
+        self._clip = clip
+        self._ts = []
+        self._last = None
+        self._warned = False
+        self.fit_failures = 0
+
+    def _fit(self, ts):
+        error = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # convergence chatter from statsmodels
+            model = ARIMA(ts, order=self._order, seasonal_order=self._seasonal_order, trend=self._trend)
+            try:
+                result = model.fit()
+            except Exception as exc:  # numerical trouble on this window
+                error = exc
+                result = None if self._last is None else self._last.apply(ts)
+            else:
+                self._last = result
+            if result is not None:
+                forecast = result.get_forecast(1)
+                mean = float(np.asarray(forecast.predicted_mean).ravel()[0])
+                se = float(np.asarray(forecast.se_mean).ravel()[0])
+        if error is not None:
+            self.fit_failures += 1
+            if not self._warned:
+                self._warned = True
+                if result is None:
+                    warnings.warn("ARIMA fit failed before any fit succeeded; no score for this step: %r"
+                                  % (error,), RuntimeWarning)
+                else:
+                    warnings.warn("ARIMA fit failed, reusing the parameters of the last successful fit: %r"
+                                  % (error,), RuntimeWarning)
+        if result is None:
+            return None
+        if not np.isfinite(se) or se < math.sqrt(_EPS):
+            se = math.sqrt(_EPS)
+        return mean, se
+
+    def score(self, x):
+        x = float(x)
+        result = None
+        stored = x
+        if len(self._ts) == self._term:
+            fit = self._fit(np.asarray(self._ts, dtype=np.float64))
+            if fit is not None:
+                mean, se = fit
+                result = (float(-stats.norm.logpdf(x, mean, se)), mean)
+                if self._clip is not None:
+                    bound = self._clip * se
+                    stored = mean + max(-bound, min(bound, x - mean))
+        self._ts.append(stored)
+        if len(self._ts) > self._term:
+            self._ts.pop(0)
+        return result
+
+
 class _ChangeFinderAbstract(object):
+    """
+    Two-stage ChangeFinder driver.
+
+    Stage one scores each observation with ``first``; the scores are
+    smoothed over ``smooth`` steps; stage two scores the smoothed series with
+    ``second``; the result is smoothed again over ``round(smooth / 2)`` steps.
+    A scorer exposes ``score(x) -> (score, predict)`` and returns ``None``
+    while it is still warming up.
+    """
+
+    def _init_stages(self, smooth, first, second, smoothing="mean"):
+        assert smooth > 2, "smooth must be 3 or more."
+        assert smoothing in ("mean", "median"), "smoothing must be 'mean' or 'median'."
+        self._smooth = smooth
+        self._smoothing_method = smoothing
+        self._smooth2 = int(round(self._smooth / 2.0))
+        self._first = first
+        self._second = second
+        self._first_scores = []
+        self._second_scores = []
+
     def update(self, x, inplace=True):
         """
         Feed one observation and return ``(score, predict)``.
@@ -138,109 +286,392 @@ class _ChangeFinderAbstract(object):
             return copy.deepcopy(self)._update(x)
         return self._update(x)
 
+    def _update(self, x):
+        predict = x
+        first = self._first.score(x)
+        if first is None:
+            return 0.0, predict
+        score, predict = first
+        self._add_one(score, self._first_scores, self._smooth)
+        if len(self._first_scores) < self._smooth:
+            return 0.0, predict
+        second_target = self._smoothing(self._first_scores)
+        second = self._second.score(second_target)
+        if second is None:
+            return 0.0, predict
+        self._add_one(second[0], self._second_scores, self._smooth2)
+        if len(self._second_scores) == self._smooth2:
+            return self._smoothing(self._second_scores), predict
+        return 0.0, predict
+
     def _add_one(self, one, ts, size):
         ts.append(one)
         if len(ts) == size + 1:
             ts.pop(0)
 
     def _smoothing(self, ts):
+        if self._smoothing_method == "median":
+            return float(np.median(ts))
         return sum(ts) / float(len(ts))
 
 
 class ChangeFinder(_ChangeFinderAbstract):
-    def __init__(self, r=0.5, order=1, smooth=7):
+    """ChangeFinder with SDAR models in both stages (Yamanishi & Takeuchi)."""
+
+    def __init__(self, r=0.5, order=1, smooth=7, clip=3.0, smoothing="mean"):
         assert order > 0, "order must be 1 or more."
-        assert smooth > 2, "term must be 3 or more."
-        self._smooth = smooth
-        self._smooth2 = int(round(self._smooth / 2.0))
         self._order = order
         self._r = r
-        self._ts = []
-        self._first_scores = []
-        self._smoothed_scores = []
-        self._second_scores = []
-        self._sdar_first = _SDAR_1Dim(r, self._order)
-        self._sdar_second = _SDAR_1Dim(r, self._order)
+        self._init_stages(smooth, _SDARScorer(r, order, clip), _SDARScorer(r, order, clip), smoothing)
+
+
+class ChangeFinderDifferenced(ChangeFinder):
+    """
+    ChangeFinder (SDAR) for series with trend and seasonality.
+
+    The input is differenced ``d`` times and seasonally differenced ``D``
+    times with period ``period`` before it reaches SDAR: the "I" and
+    seasonal "I" parts of SARIMA.  Predictions are mapped back to the
+    original scale.  The first ``d + D * period`` observations are a
+    warm-up and score 0.0.
+
+    Differencing turns a level shift into a single spike (and a seasonal
+    difference echoes it ``period`` steps later), so shifts look more like
+    outliers than they do for the state-space model.
+    """
+
+    def __init__(self, r=0.05, order=1, smooth=7, d=1, period=None, D=None, clip=3.0, smoothing="mean"):
+        assert d >= 0, "d must be 0 or more."
+        if D is None:
+            D = 1 if period else 0
+        assert D == 0 or (period is not None and period > 1), "D > 0 needs a period of 2 or more."
+        super(ChangeFinderDifferenced, self).__init__(r=r, order=order, smooth=smooth, clip=clip, smoothing=smoothing)
+        self._lags = ([int(period)] * int(D) if D else []) + [1] * int(d)
+        self._histories = [[] for _ in self._lags]
 
     def _update(self, x):
-        score = 0
-        predict = x
-        predict2 = 0
-        if len(self._ts) == self._order:  # 第一段学習
-            score, predict = self._sdar_first.update(x, self._ts)
-            self._add_one(score, self._first_scores, self._smooth)
-        self._add_one(x, self._ts, self._order)
-        second_target = None
-        if len(self._first_scores) == self._smooth:  # 平滑化
-            second_target = self._smoothing(self._first_scores)
-        if second_target is not None and len(self._smoothed_scores) == self._order:  # 第二段学習
-            score, predict2 = self._sdar_second.update(second_target, self._smoothed_scores)
-            self._add_one(score,
-                          self._second_scores, self._smooth2)
-        if second_target is not None:
-            self._add_one(second_target, self._smoothed_scores, self._order)
-        if len(self._second_scores) == self._smooth2:
-            return self._smoothing(self._second_scores), predict
-        else:
-            return 0.0, predict
+        v = float(x)
+        bases = []
+        for lag, hist in zip(self._lags, self._histories):
+            if len(hist) < lag:
+                hist.append(v)
+                return 0.0, x
+            base = hist[-lag]
+            hist.append(v)
+            if len(hist) > lag:
+                hist.pop(0)
+            bases.append(base)
+            v = v - base
+        score, predict = super(ChangeFinderDifferenced, self)._update(v)
+        return score, predict + sum(bases)
 
 
 class ChangeFinderARIMA(_ChangeFinderAbstract):
-    def __init__(self, term=30, smooth=7, order=(1, 0, 0)):
-        assert smooth > 2, "term must be 3 or more."
+    """
+    ChangeFinder whose first stage refits a (seasonal) ARIMA model on the
+    last ``term`` observations at every step and scores the next one with
+    the forecast distribution; the second stage is SDAR on the smoothed
+    scores.
+
+    ``order=(p, d, q)``, ``seasonal_order=(P, D, Q, s)`` and ``trend``
+    (``'n'``, ``'c'``, ``'t'``, ``'ct'`` or None for the statsmodels
+    default) are passed to statsmodels' ARIMA.  ``r`` and ``second_order``
+    configure the second-stage SDAR.  ``clip`` winsorizes the observations
+    kept in the window (and the second-stage learning) at that many
+    forecast standard errors.
+
+    This detector uses a fixed window, not the sequential discounting of
+    the other detectors, and performs one maximum-likelihood fit per
+    observation, so it is slow.  ``fit_failures`` counts the steps on which
+    the fit failed and the previous parameters were reused.
+    """
+
+    def __init__(self, term=30, smooth=7, order=(1, 0, 0), seasonal_order=(0, 0, 0, 0),
+                 trend=None, r=0.05, second_order=1, clip=3.0, smoothing="mean"):
         assert term > smooth, "term must be more than smooth"
-
         self._term = term
-        self._smooth = smooth
-        self._smooth2 = int(round(self._smooth / 2.0))
-        self._order = order
-        self._ts = []
-        self._first_scores = []
-        self._smoothed_scores = []
-        self._second_scores = []
+        self._order = tuple(order)
+        self._seasonal_order = tuple(seasonal_order)
+        self._trend = trend
+        self._r = r
+        self._init_stages(smooth,
+                          _ARIMAScorer(term, self._order, self._seasonal_order, trend, clip),
+                          _SDARScorer(r, second_order, clip), smoothing)
 
-    def _calc_outlier_score(self, ts, target):
-        def outlier_score(residuals, x):
-            m = residuals.mean()
-            s = np.std(residuals, ddof=1)
-            if not np.isfinite(s) or s < math.sqrt(_EPS):
-                s = math.sqrt(_EPS)
-            return -stats.norm.logpdf(x, m, s)
-        ts = np.asarray(ts, dtype=np.float64)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            arima_model = ARIMA(ts, order=self._order)
-            result = arima_model.fit()
-            pred = float(np.asarray(result.forecast(1)).ravel()[0])
-        resid = np.asarray(result.resid, dtype=np.float64)
-        return outlier_score(resid, x=target - pred), pred
+    @property
+    def fit_failures(self):
+        return self._first.fit_failures
+
+
+class ChangeFinderSTL(ChangeFinder):
+    """
+    ChangeFinder (SDAR) on the one-step-ahead residual of an OnlineSTL
+    decomposition (Mishra, Sriharsha & Zhong, PVLDB 2022).
+
+    The first ``4 * max(periods)`` observations initialize the
+    decomposition and score 0.0.  Afterwards every observation is scored
+    against ``trend + seasonal`` predicted from the state before the
+    observation is seen, which keeps the ChangeFinder convention of scoring
+    ``x_t`` under the model learned up to ``t - 1``; the decomposition is
+    then updated with ``x_t``.  ``predict`` is returned on the original
+    scale.
+
+    ``gamma`` is the smoothing factor of the seasonal estimates; the paper's
+    default 0.7 follows the latest points closely, smaller values give
+    steadier seasonal patterns and cleaner residuals.
+    """
+
+    def __init__(self, r=0.05, order=1, smooth=7, periods=7, gamma=0.7, clip=3.0, smoothing="mean"):
+        super(ChangeFinderSTL, self).__init__(r=r, order=order, smooth=smooth, clip=clip, smoothing=smoothing)
+        self._stl = OnlineSTL(periods, gamma)
+        self._init_buffer = []
+
+    @property
+    def decomposition(self):
+        """The underlying OnlineSTL object (trend, seasonal state)."""
+        return self._stl
 
     def _update(self, x):
-        score = 0
-        predict = x
-        predict2 = 0
-        if len(self._ts) == self._term:  # 第一段学習
-            try:
-                score, predict = self._calc_outlier_score(self._ts, x)
-                self._add_one(score, self._first_scores, self._smooth)
-            except Exception:
-                self._add_one(x, self._ts, self._term)
-                return 0, predict
-        self._add_one(x, self._ts, self._term)
-        second_target = None
-        if len(self._first_scores) == self._smooth:  # 平滑化
-            second_target = self._smoothing(self._first_scores)
-        if second_target is not None and len(self._smoothed_scores) == self._term:  # 第二段学習
-            try:
-                score, predict2 = self._calc_outlier_score(self._smoothed_scores, second_target)
-                self._add_one(score,
-                              self._second_scores, self._smooth2)
-            except Exception:
-                self._add_one(second_target, self._smoothed_scores, self._term)
-                return 0, predict
-        if second_target is not None:
-            self._add_one(second_target, self._smoothed_scores, self._term)
-        if len(self._second_scores) == self._smooth2:
-            return self._smoothing(self._second_scores), predict
+        x = float(x)
+        if not self._stl.initialized:
+            self._init_buffer.append(x)
+            if len(self._init_buffer) == self._stl.window:
+                self._stl.initialize(self._init_buffer)
+                self._init_buffer = []
+            return 0.0, x
+        forecast = self._stl.forecast()
+        self._stl.update(x)
+        score, resid_hat = super(ChangeFinderSTL, self)._update(x - forecast)
+        return score, forecast + resid_hat
+
+
+class _DiscountKalman1Dim(object):
+    """
+    Structural time series model (level, optional slope, optional Fourier
+    seasonal) estimated with a discount Kalman filter (West & Harrison).
+
+    Instead of process-noise variances, every state block is inflated by
+    ``1 / discount`` at each step; the observation variance is learned with
+    the forgetting factor ``r``.  ``update(x)`` scores ``x`` with the
+    one-step-ahead predictive distribution from the state before ``x`` is
+    seen and then assimilates ``x``.  The first ``warmup`` observations fit
+    the model by least squares and return ``None``.
+    """
+
+    def __init__(self, r, trend="level", period=None, harmonics=None, discount=0.98, clip=3.0):
+        assert 0.0 < r < 1.0, "r must be in (0, 1)."
+        assert trend in ("level", "linear"), "trend must be 'level' or 'linear'."
+        assert clip is None or clip > 0, "clip must be positive or None."
+        self._r = r
+        self._clip = clip
+        self._trend = trend
+        self._period = None if period is None else int(period)
+        if self._period is not None:
+            assert self._period >= 2, "period must be 2 or more."
+            if harmonics is None:
+                harmonics = self._period // 2
+            assert 1 <= harmonics <= self._period // 2, "harmonics must be in [1, period // 2]."
+        self._harmonics = 0 if self._period is None else int(harmonics)
+        if isinstance(discount, dict):
+            d = {"level": 0.98, "slope": 0.98, "seasonal": 0.98}
+            d.update(discount)
         else:
-            return 0.0, predict
+            d = {"level": float(discount), "slope": float(discount), "seasonal": float(discount)}
+        for v in d.values():
+            assert 0.0 < v <= 1.0, "discount must be in (0, 1]."
+        self._discount = d
+        self._build()
+        self._buffer = []
+        self.warmup = max(10, 2 * self._n + 2, 0 if self._period is None else 2 * self._period)
+        self._m = None
+        self._C = None
+        self._V = 0.0
+        self._t = 0
+
+    def _build(self):
+        blocks = ["level"]
+        if self._trend == "linear":
+            blocks.append("slope")
+        self._freqs = []
+        for j in range(1, self._harmonics + 1):
+            w = 2.0 * math.pi * j / self._period
+            nyquist = (self._period % 2 == 0) and (j == self._period // 2)
+            self._freqs.append((w, nyquist))
+            blocks.append("seasonal")
+            if not nyquist:
+                blocks.append("seasonal")
+        n = len(blocks)
+        G = np.zeros((n, n))
+        F = np.zeros(n)
+        G[0, 0] = 1.0
+        F[0] = 1.0
+        i = 1
+        if self._trend == "linear":
+            G[0, 1] = 1.0
+            G[1, 1] = 1.0
+            i = 2
+        for w, nyquist in self._freqs:
+            if nyquist:
+                G[i, i] = -1.0
+                F[i] = 1.0
+                i += 1
+            else:
+                c, s = math.cos(w), math.sin(w)
+                G[i, i], G[i, i + 1] = c, s
+                G[i + 1, i], G[i + 1, i + 1] = -s, c
+                F[i] = 1.0
+                i += 2
+        self._n = n
+        self._G = G
+        self._F = F
+        self._blocks = blocks
+        delta = np.array([self._discount[b] for b in blocks])
+        self._inflate = 1.0 / np.sqrt(np.outer(delta, delta))
+
+    def _design(self, t):
+        """Observation vector of the model at time ``t`` for least-squares fitting."""
+        row = [1.0]
+        if self._trend == "linear":
+            row.append(float(t))
+        for w, nyquist in self._freqs:
+            row.append(math.cos(w * t))
+            if not nyquist:
+                row.append(math.sin(w * t))
+        return row
+
+    def _initialize(self):
+        y = np.asarray(self._buffer, dtype=np.float64)
+        n = len(y)
+        t = np.arange(n, dtype=np.float64)
+        X = np.array([self._design(k) for k in t])
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X.dot(beta)
+        dof = max(n - X.shape[1], 1)
+        V = float(np.dot(resid, resid) / dof)
+        self._V = max(V, _EPS)
+        # State at the end of the warm-up (time n - 1), in the rotating
+        # Fourier representation used by the transition matrix.
+        tend = float(n - 1)
+        m = [beta[0] + (beta[1] * tend if self._trend == "linear" else 0.0)]
+        i = 1
+        if self._trend == "linear":
+            m.append(beta[1])
+            i = 2
+        for w, nyquist in self._freqs:
+            if nyquist:
+                m.append(beta[i] * math.cos(w * tend))
+                i += 1
+            else:
+                a, b = beta[i], beta[i + 1]
+                m.append(a * math.cos(w * tend) + b * math.sin(w * tend))
+                m.append(-a * math.sin(w * tend) + b * math.cos(w * tend))
+                i += 2
+        self._m = np.array(m)
+        self._C = np.eye(self._n) * self._V
+        self._t = n
+        self._buffer = []
+
+    def _predict(self):
+        a = self._G.dot(self._m)
+        R = self._G.dot(self._C).dot(self._G.T) * self._inflate
+        f = float(self._F.dot(a))
+        Q = float(self._F.dot(R).dot(self._F)) + max(self._V, _EPS)
+        return a, R, f, Q
+
+    def score(self, x):
+        """Scorer interface: ``(score, predict)`` or None during warm-up."""
+        return self.update(x)
+
+    def update(self, x):
+        x = float(x)
+        if self._m is None:
+            self._buffer.append(x)
+            if len(self._buffer) == self.warmup:
+                self._initialize()
+            return None
+        a, R, f, Q = self._predict()
+        e = x - f
+        score = 0.5 * math.log(2.0 * math.pi * Q) + 0.5 * e * e / Q
+        if self._clip is not None and (self._t - self.warmup) * self._r >= 1.0:
+            bound = self._clip * math.sqrt(Q)
+            e = max(-bound, min(bound, e))
+        A = R.dot(self._F) / Q
+        self._m = a + A * e
+        self._C = R - np.outer(A, A) * Q
+        self._C = 0.5 * (self._C + self._C.T)
+        V = max(self._V, _EPS)
+        r = max(self._r, 1.0 / (self._t - self.warmup + 1.0))
+        self._V = (1.0 - r) * V + r * V * e * e / Q
+        self._t += 1
+        return score, f
+
+    def components(self):
+        if self._m is None:
+            return None
+        out = {"level": float(self._m[0])}
+        i = 1
+        if self._trend == "linear":
+            out["slope"] = float(self._m[1])
+            i = 2
+        seasonal = 0.0
+        for w, nyquist in self._freqs:
+            seasonal += self._m[i]
+            i += 1 if nyquist else 2
+        out["seasonal"] = float(seasonal)
+        out["observation_variance"] = float(self._V)
+        return out
+
+
+class ChangeFinderSTS(_ChangeFinderAbstract):
+    """
+    ChangeFinder with a structural time series model (level, optional
+    linear trend, optional Fourier seasonality) in the first stage,
+    estimated online with a discount Kalman filter.
+
+    Parameters
+    ----------
+    r : float
+        Forgetting factor for the observation-noise variance (and for the
+        second-stage SDAR).
+    smooth : int
+        Smoothing window ``T``.
+    trend : "level" | "linear"
+        Local level, or local linear trend (level + slope).
+    period : int or None
+        Seasonal period; None for no seasonal component.
+    harmonics : int or None
+        Number of Fourier harmonics; default ``period // 2`` (equivalent to
+        a dummy-variable seasonal).  Fewer harmonics give a smoother pattern.
+    discount : float or dict
+        Discount factor(s) for the state blocks ``level``, ``slope``,
+        ``seasonal``: how fast each component may drift (0.95 lets the
+        level move noticeably within ~20 steps; 0.98-0.99 is stiffer).
+    second_order : int
+        AR order of the second-stage SDAR on the smoothed scores (default
+        1; 0 uses no AR term, only the forgetting mean).
+    clip : float or None
+        Residuals beyond ``clip`` predictive standard deviations are
+        winsorized in the learning step (not in the score), so an outlier
+        does not inflate the variance and mask the changes that follow.
+        None disables it.
+    smoothing : "median" | "mean"
+        How the first-stage scores are smoothed before the second stage.
+        The median passes sustained changes but not isolated spikes, which
+        keeps outliers from dominating the change-point score; "mean" is
+        the original ChangeFinder smoothing.
+    """
+
+    def __init__(self, r=0.05, smooth=7, trend="level", period=None, harmonics=None,
+                 discount=0.95, second_order=1, clip=3.0, smoothing="median"):
+        self._r = r
+        first = _DiscountKalman1Dim(r, trend=trend, period=period, harmonics=harmonics,
+                                    discount=discount, clip=clip)
+        self._init_stages(smooth, first, _SDARScorer(r, second_order, clip), smoothing)
+
+    @property
+    def warmup(self):
+        return self._first.warmup
+
+    def components(self):
+        """Current level / slope / seasonal estimate and observation variance."""
+        return self._first.components()

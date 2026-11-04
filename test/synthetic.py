@@ -53,3 +53,68 @@ def generate_series(seed=0, segments=DEFAULT_SEGMENTS, outliers=DEFAULT_OUTLIERS
     for k, i in enumerate(outliers):
         x[i] += outlier_sigma * sigma_at[i] * (1.0 if k % 2 == 0 else -1.0)
     return x, change_points, outliers
+
+
+# ---------------------------------------------------------------------------
+# Daily business metric with weekly seasonality, trend and regime changes.
+# ---------------------------------------------------------------------------
+
+WEEKLY_PATTERN = np.array([-60.0, -80.0, -70.0, -50.0, 20.0, 130.0, 110.0])  # Mon .. Sun
+
+
+def generate_daily_series(seed=0, n=730, level=1000.0, slope=0.3, phi=0.5, sigma=25.0,
+                          weekly=WEEKLY_PATTERN, annual_amplitude=80.0,
+                          level_shift=(200, 250.0), slope_change=(380, -0.7),
+                          seasonal_change=(500, 0.4), variance_change=(600, 60.0),
+                          outliers=((100, 400.0), (300, -500.0), (450, 350.0), (660, -300.0))):
+    """
+    A daily e-commerce-like metric: base level, weekly pattern (weekends
+    high), a mild annual cycle, linear growth and AR(1) noise, with the
+    regime changes a monitoring team would want to catch:
+
+    * ``level_shift=(t, delta)``: a campaign or new channel adds ``delta``.
+    * ``slope_change=(t, delta)``: growth changes by ``delta`` per day.
+    * ``seasonal_change=(t, factor)``: the weekly pattern is scaled by ``factor``.
+    * ``variance_change=(t, sigma)``: innovation std becomes ``sigma``.
+    * ``outliers``: isolated spikes ``(t, delta)`` (flash sale, outage, holiday).
+
+    Returns ``(x, changes, outlier_points)`` where ``changes`` maps the change
+    type to its index.
+    """
+    rng = np.random.RandomState(seed)
+    t = np.arange(n)
+    trend = level + slope * t
+    if slope_change is not None:
+        t0, delta = slope_change
+        trend = trend + delta * np.clip(t - t0, 0, None)
+    if level_shift is not None:
+        t0, delta = level_shift
+        trend = trend + delta * (t >= t0)
+    season = weekly[t % 7].astype(np.float64).copy()
+    if seasonal_change is not None:
+        t0, factor = seasonal_change
+        season[t >= t0] *= factor
+    annual = annual_amplitude * np.sin(2.0 * np.pi * (t - 60) / 365.0)
+    sig = np.full(n, sigma, dtype=np.float64)
+    if variance_change is not None:
+        t0, s = variance_change
+        sig[t >= t0] = s
+    e = rng.normal(size=n) * sig
+    noise = np.zeros(n)
+    for k in range(1, n):
+        noise[k] = phi * noise[k - 1] + e[k]
+    x = trend + season + annual + noise
+    outlier_points = []
+    for i, delta in (outliers or ()):
+        x[i] += delta
+        outlier_points.append(i)
+    changes = {}
+    if level_shift is not None:
+        changes["level"] = level_shift[0]
+    if slope_change is not None:
+        changes["slope"] = slope_change[0]
+    if seasonal_change is not None:
+        changes["seasonal"] = seasonal_change[0]
+    if variance_change is not None:
+        changes["variance"] = variance_change[0]
+    return x, changes, outlier_points

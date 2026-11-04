@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-import copy
-
 import numpy as np
 import pytest
 
 import changefinder
-from .synthetic import generate_series
+from .synthetic import generate_daily_series, generate_series
 
 
 def _run(detector, data):
@@ -105,9 +103,9 @@ class TestSDAR(object):
         sdar = changefinder._SDAR_1Dim(0.02, 1)
         resid = []
         for t in range(1, n):
-            _, xhat = sdar.update(x[t], [x[t - 1]])
+            result = sdar.update(x[t], [x[t - 1]])
             if t > 500:
-                resid.append(x[t] - xhat)
+                resid.append(x[t] - result[1])
         assert np.var(resid) < 0.6 * np.var(x[500:])
 
     def test_score_is_negative_gaussian_log_likelihood(self):
@@ -211,16 +209,11 @@ class TestChangeFinder(object):
     def test_update_not_inplace_leaves_state_untouched(self):
         cf = changefinder.ChangeFinder(r=0.1, order=self._order, smooth=self._smooth)
         _run(cf, self._data[:100])
-        snapshot = copy.deepcopy(cf.__dict__)
+        snapshot = _state(cf)
         peek1 = cf.update(self._data[100], inplace=False)
         peek2 = cf.update(self._data[100], inplace=False)
         assert peek1 == peek2
-        for key, value in snapshot.items():
-            if isinstance(value, changefinder._SDAR_1Dim):
-                for k, v in value.__dict__.items():
-                    np.testing.assert_array_equal(getattr(cf.__dict__[key], k), v)
-            else:
-                assert cf.__dict__[key] == value
+        assert _state(cf) == snapshot
         committed = cf.update(self._data[100])
         assert committed == peek1
 
@@ -233,6 +226,21 @@ class TestChangeFinder(object):
             changefinder.ChangeFinder(r=0.0)
         with pytest.raises(AssertionError):
             changefinder.ChangeFinder(r=1.0)
+
+
+def _state(obj):
+    """Recursively convert a detector's state into plain Python data."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return [_state(o) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _state(v) for k, v in obj.items()}
+    if type(obj).__module__.startswith("statsmodels"):
+        return "<%s>" % type(obj).__name__   # fitted results carry lazy caches
+    if hasattr(obj, "__dict__"):
+        return _state(vars(obj))
+    return obj
 
 
 def _quiet_scores(scores, change_points, outliers, start=150, window=60):
@@ -298,7 +306,7 @@ class TestChangeFinderNaturalSeries(object):
         for order in (1, 8):
             cf = changefinder.ChangeFinder(r=0.03, order=order, smooth=7)
             _run(cf, x)
-            errors[order] = abs(cf._sdar_first._sigma - 1.0)
+            errors[order] = abs(cf._first._sdar._sigma - 1.0)
         assert errors[1] < errors[8]
 
     @pytest.mark.xfail(reason="empirical: a moderate change of the AR coefficient alone is not reliably "
@@ -361,10 +369,44 @@ class TestChangeFinderARIMA(object):
     def test_update_not_inplace_leaves_state_untouched(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
         _run(cf, self._data[:60])
-        snapshot = copy.deepcopy(cf.__dict__)
+        snapshot = _state(cf)
         peek = cf.update(self._data[60], inplace=False)
-        assert cf.__dict__ == snapshot
+        assert _state(cf) == snapshot
         assert cf.update(self._data[60]) == peek
+
+    def test_failed_fit_reuses_previous_parameters(self):
+        import statsmodels.tsa.arima.model as arima_model
+        original_fit = arima_model.ARIMA.fit
+        calls = {"n": 0}
+
+        def flaky_fit(model, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise ValueError("forced failure")
+            return original_fit(model, *args, **kwargs)
+
+        arima_model.ARIMA.fit = flaky_fit
+        try:
+            cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+            with pytest.warns(RuntimeWarning, match="reusing"):
+                scores, predicts = _run(cf, self._data[:150])
+        finally:
+            arima_model.ARIMA.fit = original_fit
+        assert np.all(np.isfinite(scores)) and np.all(np.isfinite(predicts))
+        assert cf.fit_failures == 150 - self._term - 1
+        assert np.any(scores[self._term + 2 * self._smooth:] != 0.0)
+
+    def test_window_is_winsorized(self):
+        rng = np.random.RandomState(0)
+        x = rng.normal(size=80) + 5
+        x[50] += 50.0
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
+        _run(cf, x[:51])
+        stored = cf._first._ts[-1]
+        assert abs(stored - 5.0) < 10.0 < abs(x[50] - 5.0)
+        cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order, clip=None)
+        _run(cf, x[:51])
+        assert cf._first._ts[-1] == x[50]
 
     def test_outlier_score_is_finite_on_constant_history(self):
         cf = changefinder.ChangeFinderARIMA(term=self._term, smooth=self._smooth, order=self._arima_order)
@@ -377,3 +419,171 @@ class TestChangeFinderARIMA(object):
             changefinder.ChangeFinderARIMA(smooth=2)
         with pytest.raises(AssertionError):
             changefinder.ChangeFinderARIMA(term=5, smooth=7)
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderARIMA(term=15, smooth=7, seasonal_order=(0, 1, 0, 7))
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderARIMA(seasonal_order=(1, 0, 0, 0))
+
+
+def _trend_seasonal_series(seed=0, n=700, period=7, noise=0.5, shift=(400, 5.0)):
+    rng = np.random.RandomState(seed)
+    t = np.arange(n)
+    season = 3.0 * np.sin(2 * np.pi * t / period) + 1.0 * np.cos(4 * np.pi * t / period)
+    x = 10.0 + 0.02 * t + season + rng.normal(scale=noise, size=n)
+    if shift is not None:
+        x[shift[0]:] += shift[1]
+    return x, 10.0 + 0.02 * t, season
+
+
+def _assert_shift_detected(scores, at, quiet_ranges, min_ratio=3.0):
+    quiet = np.concatenate([scores[a:b] for a, b in quiet_ranges])
+    peak = scores[at:at + 30].max()
+    assert peak > quiet.max() and peak > min_ratio * max(np.percentile(quiet, 99), 0.5), (
+        "shift at %d not detected (peak=%f, quiet max=%f)" % (at, peak, quiet.max()))
+
+
+class TestOnlineSTL(object):
+    def test_decomposes_trend_and_seasonality(self):
+        from changefinder.onlinestl import OnlineSTL
+        x, trend, season = _trend_seasonal_series(shift=None)
+        stl = OnlineSTL(7, gamma=0.7).initialize(x[:28])
+        T, S, R, F = [], [], [], []
+        for v in x[28:]:
+            F.append(stl.forecast())
+            tt, ss, rr = stl.update(v)
+            T.append(tt)
+            S.append(ss.sum())
+            R.append(rr)
+        T, S, R, F = (np.array(a)[100:] for a in (T, S, R, F))
+        assert np.std(R) < 0.5                                   # below the noise level
+        assert np.std(T - trend[28:][100:]) < 0.3
+        assert np.std(S - season[28:][100:]) < 0.8
+        assert np.std(x[28:][100:] - F) < 0.3 * np.std(x)        # forecast beats the raw spread
+
+    def test_multiple_periods(self):
+        from changefinder.onlinestl import OnlineSTL
+        rng = np.random.RandomState(1)
+        t = np.arange(900)
+        x = 5 + 2 * np.sin(2 * np.pi * t / 7) + 3 * np.sin(2 * np.pi * t / 30) + rng.normal(scale=0.3, size=900)
+        stl = OnlineSTL([7, 30]).initialize(x[:120])
+        R = np.array([stl.update(v)[2] for v in x[120:]])
+        assert np.all(np.isfinite(R))
+        assert np.std(R[200:]) < 0.4
+
+    def test_needs_four_periods_to_initialize(self):
+        from changefinder.onlinestl import OnlineSTL
+        with pytest.raises(AssertionError):
+            OnlineSTL(10).initialize(np.zeros(39))
+
+
+class TestChangeFinderDifferenced(object):
+    def test_warmup_and_original_scale_predictions(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderDifferenced(r=0.05, order=1, d=1, period=7)
+        scores, predicts = _run(cf, x)
+        assert np.all(scores[:8] == 0.0) and np.all(predicts[:8] == x[:8])
+        assert np.std(x[150:400] - predicts[150:400]) < 0.2 * np.std(x)
+
+    def test_detects_level_shift_on_seasonal_series(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderDifferenced(r=0.05, order=1, d=1, period=7)
+        scores, _ = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
+
+    def test_default_seasonal_difference_follows_period(self):
+        assert changefinder.ChangeFinderDifferenced(period=7)._lags == [7, 1]
+        assert changefinder.ChangeFinderDifferenced()._lags == [1]
+        assert changefinder.ChangeFinderDifferenced(d=0, period=12, D=1)._lags == [12]
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderDifferenced(D=1)
+
+
+class TestChangeFinderSTL(object):
+    def test_detects_level_shift_on_seasonal_series(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderSTL(r=0.05, order=1, periods=7, gamma=0.3)
+        scores, predicts = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        assert np.all(scores[:28] == 0.0)
+        assert cf.decomposition.initialized
+        assert np.std(x[150:400] - predicts[150:400]) < 0.2 * np.std(x)
+        _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
+
+
+class TestChangeFinderSTS(object):
+    def test_recovers_level_slope_and_noise(self):
+        x, trend, _ = _trend_seasonal_series(shift=None)
+        cf = changefinder.ChangeFinderSTS(r=0.05, trend="linear", period=7)
+        scores, predicts = _run(cf, x)
+        assert np.all(scores[:cf.warmup] == 0.0)
+        c = cf.components()
+        assert abs(c["slope"] - 0.02) < 0.01
+        assert abs(c["level"] - trend[-1]) < 1.0
+        assert 0.1 < c["observation_variance"] < 0.6
+        assert np.std(x[150:] - predicts[150:]) < 0.7
+
+    def test_detects_level_shift_on_seasonal_series(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderSTS(r=0.05, trend="linear", period=7)
+        scores, _ = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
+
+    def test_realistic_daily_series(self):
+        x, changes, outliers = generate_daily_series(seed=0)
+        cf = changefinder.ChangeFinderSTS(r=0.03, smooth=7, trend="linear", period=7)
+        scores, _ = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        quiet = _quiet_scores(scores, list(changes.values()), outliers, start=120, window=40)
+        p99 = max(np.percentile(quiet, 99), 0.5)
+        for kind in ("level", "seasonal", "variance"):
+            b = changes[kind]
+            peak = scores[b:b + 30].max()
+            assert peak > quiet.max() and peak > 3.0 * p99, (
+                "%s change at %d not detected (peak=%f, quiet max=%f)" % (kind, b, peak, quiet.max()))
+        # Isolated spikes (flash sale, outage) are not reported as changes.
+        for o in outliers:
+            assert scores[o:o + 30].max() < 3.0 * p99
+
+    @pytest.mark.xfail(reason="a change of growth rate adds only a fraction of the noise sd per step; "
+                              "per-step predictive scores cannot see it, see README",
+                       strict=False)
+    def test_realistic_daily_series_slope_change(self):
+        x, changes, outliers = generate_daily_series(seed=0)
+        cf = changefinder.ChangeFinderSTS(r=0.03, smooth=7, trend="linear", period=7)
+        scores, _ = _run(cf, x)
+        quiet = _quiet_scores(scores, list(changes.values()), outliers, start=120, window=40)
+        b = changes["slope"]
+        assert scores[b:b + 30].max() > quiet.max()
+
+    def test_second_order_zero(self):
+        x, _, _ = _trend_seasonal_series()
+        cf = changefinder.ChangeFinderSTS(r=0.05, trend="linear", period=7, second_order=0)
+        scores, _ = _run(cf, x)
+        assert np.all(np.isfinite(scores))
+        _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
+
+    def test_outlier_does_not_mask_following_shift(self):
+        # With clip=None a 15-sigma spike inflates the variance estimate and
+        # hides a 10-sigma level shift 60 steps later; the default clipping keeps it visible.
+        x, _, _ = _trend_seasonal_series()
+        x[340] += 7.5
+        peaks = {}
+        for clip in (None, 3.0):
+            cf = changefinder.ChangeFinderSTS(r=0.05, trend="linear", period=7, clip=clip)
+            scores, _ = _run(cf, x)
+            peaks[clip] = scores[400:430].max()
+        assert peaks[3.0] > 3.0 * peaks[None]
+
+    def test_options(self):
+        for kw in (dict(trend="level"), dict(period=12, harmonics=3), dict(period=8),
+                   dict(discount={"level": 0.9}), dict(smoothing="mean", clip=None)):
+            cf = changefinder.ChangeFinderSTS(r=0.1, **kw)
+            x, _, _ = _trend_seasonal_series(n=200)
+            scores, _ = _run(cf, x)
+            assert np.all(np.isfinite(scores))
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderSTS(trend="quadratic")
+        with pytest.raises(AssertionError):
+            changefinder.ChangeFinderSTS(period=7, harmonics=5)
