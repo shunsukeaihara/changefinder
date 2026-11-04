@@ -131,7 +131,7 @@ two-stage structure above; they differ in the first-stage model.
    * - ``ChangeFinder``
      - SDAR, an AR(``order``) model with forgetting factor ``r``
      - Stationary series; the original algorithm.
-   * - ``ChangeFinderSI``
+   * - ``ChangeFinderDifferenced``
      - SDAR on the differenced input (``d`` regular and ``D`` seasonal
        differences with ``period``), predictions mapped back to the
        original scale
@@ -175,12 +175,14 @@ Common to all detectors:
     Without it one outlier inflates the variance estimate and hides the
     changes of the next ``1 / r`` steps. ``None`` disables it.
 
-SDAR based detectors (``ChangeFinder``, ``ChangeFinderSI``, ``ChangeFinderSTL``):
+SDAR based detectors (``ChangeFinder``, ``ChangeFinderDifferenced``, ``ChangeFinderSTL``):
 
 ``r``
     Forgetting factor in (0, 1). About ``1 / r`` observations are effective,
     so ``r=0.05`` remembers roughly the last 20 points and ``r=0.01`` the
     last 100. Smaller ``r`` gives steadier estimates and slower adaptation.
+    ``ChangeFinder`` keeps the original default of 0.5; the other detectors
+    default to 0.05.
 ``order``
     AR order. Use 1, at most 2, on real data: with only ``1 / r`` effective
     observations higher orders overfit, underestimate the residual variance
@@ -284,7 +286,7 @@ Changelog
 ---------
 
 0.5
-    ``ChangeFinderSI``, ``ChangeFinderSTL`` (with ``OnlineSTL``) and
+    ``ChangeFinderDifferenced``, ``ChangeFinderSTL`` (with ``OnlineSTL``) and
     ``ChangeFinderSTS``; seasonal and trend options for
     ``ChangeFinderARIMA``; ``clip`` and ``smoothing`` options; SDAR warm
     start without a burn-in spike.

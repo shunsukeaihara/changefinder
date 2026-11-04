@@ -476,27 +476,27 @@ class TestOnlineSTL(object):
             OnlineSTL(10).initialize(np.zeros(39))
 
 
-class TestChangeFinderSI(object):
+class TestChangeFinderDifferenced(object):
     def test_warmup_and_original_scale_predictions(self):
         x, _, _ = _trend_seasonal_series()
-        cf = changefinder.ChangeFinderSI(r=0.05, order=1, d=1, period=7)
+        cf = changefinder.ChangeFinderDifferenced(r=0.05, order=1, d=1, period=7)
         scores, predicts = _run(cf, x)
         assert np.all(scores[:8] == 0.0) and np.all(predicts[:8] == x[:8])
         assert np.std(x[150:400] - predicts[150:400]) < 0.2 * np.std(x)
 
     def test_detects_level_shift_on_seasonal_series(self):
         x, _, _ = _trend_seasonal_series()
-        cf = changefinder.ChangeFinderSI(r=0.05, order=1, d=1, period=7)
+        cf = changefinder.ChangeFinderDifferenced(r=0.05, order=1, d=1, period=7)
         scores, _ = _run(cf, x)
         assert np.all(np.isfinite(scores))
         _assert_shift_detected(scores, 400, [(150, 400), (460, 700)])
 
     def test_default_seasonal_difference_follows_period(self):
-        assert changefinder.ChangeFinderSI(period=7)._lags == [7, 1]
-        assert changefinder.ChangeFinderSI()._lags == [1]
-        assert changefinder.ChangeFinderSI(d=0, period=12, D=1)._lags == [12]
+        assert changefinder.ChangeFinderDifferenced(period=7)._lags == [7, 1]
+        assert changefinder.ChangeFinderDifferenced()._lags == [1]
+        assert changefinder.ChangeFinderDifferenced(d=0, period=12, D=1)._lags == [12]
         with pytest.raises(AssertionError):
-            changefinder.ChangeFinderSI(D=1)
+            changefinder.ChangeFinderDifferenced(D=1)
 
 
 class TestChangeFinderSTL(object):

@@ -325,7 +325,7 @@ class ChangeFinder(_ChangeFinderAbstract):
         self._init_stages(smooth, _SDARScorer(r, order, clip), _SDARScorer(r, order, clip), smoothing)
 
 
-class ChangeFinderSI(ChangeFinder):
+class ChangeFinderDifferenced(ChangeFinder):
     """
     ChangeFinder (SDAR) for series with trend and seasonality.
 
@@ -340,12 +340,12 @@ class ChangeFinderSI(ChangeFinder):
     outliers than they do for the state-space model.
     """
 
-    def __init__(self, r=0.5, order=1, smooth=7, d=1, period=None, D=None, clip=3.0, smoothing="mean"):
+    def __init__(self, r=0.05, order=1, smooth=7, d=1, period=None, D=None, clip=3.0, smoothing="mean"):
         assert d >= 0, "d must be 0 or more."
         if D is None:
             D = 1 if period else 0
         assert D == 0 or (period is not None and period > 1), "D > 0 needs a period of 2 or more."
-        super(ChangeFinderSI, self).__init__(r=r, order=order, smooth=smooth, clip=clip, smoothing=smoothing)
+        super(ChangeFinderDifferenced, self).__init__(r=r, order=order, smooth=smooth, clip=clip, smoothing=smoothing)
         self._lags = ([int(period)] * int(D) if D else []) + [1] * int(d)
         self._histories = [[] for _ in self._lags]
 
@@ -362,7 +362,7 @@ class ChangeFinderSI(ChangeFinder):
                 hist.pop(0)
             bases.append(base)
             v = v - base
-        score, predict = super(ChangeFinderSI, self)._update(v)
+        score, predict = super(ChangeFinderDifferenced, self)._update(v)
         return score, predict + sum(bases)
 
 
@@ -421,7 +421,7 @@ class ChangeFinderSTL(ChangeFinder):
     steadier seasonal patterns and cleaner residuals.
     """
 
-    def __init__(self, r=0.5, order=1, smooth=7, periods=7, gamma=0.7, clip=3.0, smoothing="mean"):
+    def __init__(self, r=0.05, order=1, smooth=7, periods=7, gamma=0.7, clip=3.0, smoothing="mean"):
         super(ChangeFinderSTL, self).__init__(r=r, order=order, smooth=smooth, clip=clip, smoothing=smoothing)
         self._stl = OnlineSTL(periods, gamma)
         self._init_buffer = []
